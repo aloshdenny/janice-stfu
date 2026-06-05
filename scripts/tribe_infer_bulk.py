@@ -23,32 +23,14 @@ CHUNK = 10
 DATA_DIR = Path("./data")
 
 VIDEOS = {
-    "porn":    ["porn5.mp4",    "porn6.mp4",    "porn7.mp4",    "porn8.mp4"],
-    "gore":    ["gore5.mp4",    "gore6.mp4",    "gore7.mp4",    "gore8.mp4"],
-    "cute":    ["cute5.mp4",    "cute6.mp4",    "cute7.mp4",    "cute8.mp4"],
-    "nature":  ["nature5.mp4",  "nature6.mp4",  "nature7.mp4",  "nature8.mp4"],
-    "food":    ["food5.mp4",    "food6.mp4",    "food7.mp4",    "food8.mp4"],
-    "kissing": ["kissing5.mp4", "kissing6.mp4", "kissing7.mp4", "kissing8.mp4"],
-    "fight": [
-        "fight1.mp4",
-        "fight2.mp4",
-        "fight3.mp4",
-        "fight4.mp4",
-        "fight5.mp4",
-        "fight6.mp4",
-        "fight7.mp4",
-        "fight8.mp4",
-    ],
-    "chase": [
-        "chase1.mp4",
-        "chase2.mp4",
-        "chase3.mp4",
-        "chase4.mp4",
-        "chase5.mp4",
-        "chase6.mp4",
-        "chase7.mp4",
-        "chase8.mp4",
-    ],
+    "porn": ["porn1.mp4", "porn2.mp4", "porn3.mp4", "porn4.mp4", "porn5.mp4", "porn6.mp4", "porn7.mp4", "porn8.mp4"],
+    "gore":    ["gore1.mp4", "gore2.mp4", "gore3.mp4", "gore4.mp4", "gore5.mp4", "gore6.mp4", "gore7.mp4", "gore8.mp4"],
+    "cute":    ["cute1.mp4", "cute2.mp4", "cute3.mp4", "cute4.mp4", "cute5.mp4",    "cute6.mp4",    "cute7.mp4",    "cute8.mp4"],
+    "nature":  ["nature1.mp4",  "nature2.mp4",  "nature3.mp4",  "nature4.mp4",  "nature5.mp4",  "nature6.mp4",  "nature7.mp4",  "nature8.mp4"],
+    "kissing": ["kissing1.mp4", "kissing2.mp4", "kissing3.mp4", "kissing4.mp4", "kissing5.mp4", "kissing6.mp4", "kissing7.mp4", "kissing8.mp4"],
+    "fight": ["fight1.mp4", "fight2.mp4", "fight3.mp4", "fight4.mp4", "fight5.mp4", "fight6.mp4", "fight7.mp4", "fight8.mp4"],
+    "chase": ["chase1.mp4", "chase2.mp4", "chase3.mp4", "chase4.mp4", "chase5.mp4", "chase6.mp4", "chase7.mp4", "chase8.mp4"],
+    "food": ["food1.mp4", "food2.mp4", "food3.mp4", "food4.mp4", "food5.mp4", "food6.mp4", "food7.mp4", "food8.mp4"],
 }
 
 # ── Worker ────────────────────────────────────────────────────────────────────
@@ -86,9 +68,8 @@ def render_worker(i, end, preds_chunk, segments_chunk, out_path):
 # ── Display ───────────────────────────────────────────────────────────────────
 
 os.environ["DISPLAY"] = ":99"
-if not os.path.exists("/tmp/.X11-unix/X99"):
-    os.system("Xvfb :99 -screen 0 1024x768x24 &")
-    time.sleep(1)
+os.system("Xvfb :99 -screen 0 1024x768x24 &> /dev/null &")
+time.sleep(1)
 
 # ── Model (load once) ─────────────────────────────────────────────────────────
 
@@ -108,7 +89,7 @@ def process_video(video_path: Path, out_dir: Path):
     segments_path = out_dir / "segments.npy"
     final_path    = out_dir / "brain_full.png"
 
-    if final_path.exists():
+    if final_path.exists() and preds_path.exists():
         print(f"  [SKIP] Already done: {final_path}")
         return
 
