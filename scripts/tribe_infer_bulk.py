@@ -29,6 +29,26 @@ VIDEOS = {
     "nature":  ["nature5.mp4",  "nature6.mp4",  "nature7.mp4",  "nature8.mp4"],
     "food":    ["food5.mp4",    "food6.mp4",    "food7.mp4",    "food8.mp4"],
     "kissing": ["kissing5.mp4", "kissing6.mp4", "kissing7.mp4", "kissing8.mp4"],
+    "fight": [
+        "fight1.mp4",
+        "fight2.mp4",
+        "fight3.mp4",
+        "fight4.mp4",
+        "fight5.mp4",
+        "fight6.mp4",
+        "fight7.mp4",
+        "fight8.mp4",
+    ],
+    "chase": [
+        "chase1.mp4",
+        "chase2.mp4",
+        "chase3.mp4",
+        "chase4.mp4",
+        "chase5.mp4",
+        "chase6.mp4",
+        "chase7.mp4",
+        "chase8.mp4",
+    ],
 }
 
 # ── Worker ────────────────────────────────────────────────────────────────────
