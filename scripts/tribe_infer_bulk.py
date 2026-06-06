@@ -4,6 +4,8 @@ import numpy as np
 import os
 import warnings
 import logging
+import subprocess
+import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -11,6 +13,40 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from multiprocessing import Process, cpu_count
 from concurrent.futures import ThreadPoolExecutor
 import time
+
+# ── Video-only events helper (bypasses whisperx) ──────────────────────────────
+
+def _get_duration(video_path: Path) -> float:
+    """Use ffprobe to get video duration in seconds."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
+        capture_output=True, text=True,
+    )
+    try:
+        return round(float(result.stdout.strip()) - 0.1, 3)
+    except (ValueError, AttributeError):
+        return 29.9
+
+def make_video_only_df(video_path: Path) -> pd.DataFrame:
+    """Build the minimal events DataFrame that TribeModel.predict() needs,
+    without calling get_events_dataframe (which invokes whisperx)."""
+    duration = _get_duration(video_path)
+    return pd.DataFrame([{
+        "type":      "Video",
+        "start":     0.0,
+        "duration":  duration,
+        "timeline":  "default",
+        "subject":   "default",
+        "session":   "",
+        "task":      "",
+        "run":       "",
+        "filepath":  str(video_path.resolve()),
+        "frequency": 60.0,
+        "offset":    0.0,
+        "stop":      duration,
+        "context":   float("nan"),
+    }])
 
 warnings.filterwarnings("ignore")
 logging.disable(logging.CRITICAL)
@@ -100,7 +136,7 @@ def process_video(video_path: Path, out_dir: Path):
         segments = np.load(segments_path, allow_pickle=True)
     else:
         print(f"  [INFER] {video_path.name}")
-        df = model.get_events_dataframe(video_path=video_path)
+        df = make_video_only_df(video_path)   # skip whisperx
         preds, segments = model.predict(events=df)
         print(f"  Predictions shape: {preds.shape}")
         np.save(preds_path, preds)
