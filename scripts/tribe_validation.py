@@ -46,29 +46,61 @@ def make_video_only_df(video_path):
 print("Loading baseline model...")
 model_base = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
 
-# ── Load abliterated model with a SEPARATE cache folder ───────────────────────
-# Copy original cache so model weights + HF downloads don't re-download
-if not CACHE_ABL.exists():
-    print("Copying cache for abliterated model...")
-    shutil.copytree(CACHE_BASE, CACHE_ABL)
+# ── Load abliterated model with a clean, separate cache ───────────────────────
+# Always wipe and re-copy so no stale exca activations from pre-patch runs
+# survive into model_abl.predict(). The HF model files themselves are just
+# symlinks/small manifests so the copy is fast; the exca feature caches are
+# what we need absent so the patched weights actually run a fresh forward pass.
+
+print("Wiping cache_abliterated and re-copying from cache_base...")
+if CACHE_ABL.exists():
+    shutil.rmtree(CACHE_ABL)
+shutil.copytree(CACHE_BASE, CACHE_ABL)
+
+# Remove any exca/feature-cache subdirs that got copied over — we want
+# model downloads preserved but all video-feature caches gone so predict()
+# re-runs the encoder with the abliterated weights.
+for d in list(CACHE_ABL.iterdir()):
+    if d.is_dir() and d.name not in ("hub", "models--facebook--tribev2"):
+        shutil.rmtree(d)
+        print(f"  Cleared: {d.name[:80]}")
 
 print("Loading abliterated model...")
 model_abl = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_ABL)
 
-# Patch abliterated V-JEPA2 weights
+# Patch abliterated V-JEPA2 weights into the in-memory model
 vjepa2_abl = model_abl.data.video_feature.image.model.model
+vjepa2_base = model_base.data.video_feature.image.model.model
 state_dict  = torch.load(OUT_DIR / "vjepa2_abliterated.pt", map_location=DEVICE)
 vjepa2_abl.load_state_dict(state_dict)
 
-# Clear ALL exca video feature caches in the abliterated cache folder
-# so it re-extracts with modified weights
-abl_exca_dirs = [d for d in CACHE_ABL.iterdir()
-                 if d.is_dir() and "HuggingFaceVideo" in d.name]
-for d in abl_exca_dirs:
-    shutil.rmtree(d)
-    print(f"  Cleared abliterated cache: {d.name[:60]}...")
+# ── Diagnostic 1: confirm weights actually differ ─────────────────────────────
+print("=== DIAGNOSTIC: weight diff check ===")
+total_diff = 0.0
+total_params = 0
+for (name_b, p_b), (name_a, p_a) in zip(
+        vjepa2_base.named_parameters(), vjepa2_abl.named_parameters()):
+    diff = (p_b.data - p_a.data).abs().sum().item()
+    total_diff += diff
+    total_params += p_b.numel()
+    if diff > 0:
+        print(f"  CHANGED: {name_b}  |Δ|={diff:.6f}")
+if total_diff == 0:
+    print("  !! ZERO DIFF — vjepa2_abliterated.pt is identical to baseline weights")
+    print("     Weight surgery likely failed (block.attention.proj not found)")
+    print("     Run abliteration script again and check for AttributeError")
+else:
+    print(f"  Total |Δ| across {total_params} params: {total_diff:.4f}  ✓ weights differ")
+print()
 
-print("Abliterated model ready.\n")
+# ── Diagnostic 2: confirm model_abl.predict routes through vjepa2_abl ─────────
+print("=== DIAGNOSTIC: forward hook routing check ===")
+_abl_hook_fired = []
+def _routing_hook(module, input, output):
+    _abl_hook_fired.append(True)
+_hook = vjepa2_abl.register_forward_hook(_routing_hook)
+
+print("Abliterated weights patched.\n")
 
 # ── Load masks ────────────────────────────────────────────────────────────────
 
@@ -94,10 +126,17 @@ for vp in val_videos:
     preds_base = preds_base[:30]
     torch.cuda.empty_cache(); gc.collect()
 
+    _abl_hook_fired.clear()
     print("  Running abliterated...")
     preds_abl, _  = model_abl.predict(events=df)
     preds_abl = preds_abl[:30]
     torch.cuda.empty_cache(); gc.collect()
+
+    if _abl_hook_fired:
+        print(f"  [ROUTING ✓] vjepa2_abl.forward() called {len(_abl_hook_fired)}x")
+    else:
+        print("  [ROUTING ✗] vjepa2_abl.forward() was NEVER called — predict()")
+        print("              bypasses the patched model (cached or different code path)")
 
     print()
     for mask, mname in [(gore_mask, "gore_mask"), (porn_mask, "porn_mask")]:
