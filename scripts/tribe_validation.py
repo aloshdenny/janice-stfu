@@ -12,9 +12,7 @@ OUT_DIR    = Path("./abliterated")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 def make_video_only_df(video_path):
-    """Build minimal events dataframe with just the Video row — skips whisperx entirely."""
     import subprocess
-    # Get duration via ffprobe
     result = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
          "-of", "default=noprint_wrappers=1:nokey=1", str(video_path)],
@@ -23,12 +21,19 @@ def make_video_only_df(video_path):
     duration = float(result.stdout.strip()) if result.stdout.strip() else 30.0
 
     return pd.DataFrame([{
-        "type":     "Video",
-        "start":    0.0,
-        "duration": duration,
-        "filepath": str(video_path),
-        "text":     None,
-        "context":  "",
+        "type":      "Video",
+        "start":     0.0,
+        "duration":  duration,
+        "timeline":  "default",
+        "subject":   "default",
+        "session":   "",
+        "task":      "",
+        "run":       "",
+        "filepath":  str(video_path.resolve()),
+        "frequency": 60.0,
+        "offset":    0.0,
+        "stop":      duration,
+        "context":   float("nan"),
     }])
 
 # ── Load models ───────────────────────────────────────────────────────────────
