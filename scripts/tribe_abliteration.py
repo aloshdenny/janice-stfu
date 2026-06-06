@@ -229,35 +229,20 @@ def apply_weight_surgery():
     ortho = torch.stack(ortho)
 
     block = encoder_blocks[TARGET_IDX]
-    W_mod = None
-    for path in ["attention.output.dense", "attention.out_proj",
-                 "attn.proj", "attn.out_proj", "self_attn.out_proj"]:
-        try:
-            mod = block
-            for p in path.split("."):
-                mod = getattr(mod, p)
-            if isinstance(mod, nn.Linear):
-                W_mod = mod
-                print(f"  Target: block[{TARGET_IDX}].{path}  {mod.weight.shape}")
-                break
-        except AttributeError:
-            continue
+    W_mod = block.attention.proj          # directly target attention.proj
+    W     = W_mod.weight.data
+    print(f"  Target: block[{TARGET_IDX}].attention.proj  {W.shape}")
 
-    if W_mod is None:
-        print("  Could not find attn output proj. Linear layers in block:")
-        for name, mod in block.named_modules():
-            if isinstance(mod, nn.Linear):
-                print(f"    .{name}  {mod.weight.shape}")
-        return
-
-    W = W_mod.weight.data
     for q in ortho:
         W -= (W @ q).unsqueeze(-1) * q
     W_mod.weight.data = W
 
     out_path = OUT_DIR / "vjepa2_abliterated.pt"
     torch.save(vjepa2_module.state_dict(), out_path)
-    print(f"Saved abliterated weights → {out_path}")
+    print(f"  Saved → {out_path}")
+
+    # Verify file was written
+    print(f"  File size: {out_path.stat().st_size / 1e6:.1f} MB")
 
 
 apply_weight_surgery()
