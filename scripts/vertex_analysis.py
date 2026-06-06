@@ -7,11 +7,16 @@ import matplotlib.pyplot as plt
 # ── Load all preds ────────────────────────────────────────────────────────────
 
 STUDY_ROOT = Path("./tribe_study")
-CATEGORIES = ["porn", "gore", "cute", "nature", "food", "kissing"]
+CATEGORIES = ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]
+MAX_TRS = 30
 
 def load_category_mean(category):
     paths = sorted((STUDY_ROOT / category).glob("*/preds.npy"))
-    arrays = [np.load(p).mean(axis=0) for p in paths]
+    arrays = []
+    for p in paths:
+        d = np.load(p)
+        d = d[:MAX_TRS]          # truncate to 30 TRs regardless of length
+        arrays.append(d.mean(axis=0))
     return np.stack(arrays).mean(axis=0)
 
 print("Loading category means...")
@@ -19,24 +24,44 @@ means = {cat: load_category_mean(cat) for cat in CATEGORIES}
 
 # ── Contrasts ─────────────────────────────────────────────────────────────────
 
-neutral         = np.stack([means["cute"], means["nature"], means["food"]]).mean(axis=0)
-porn_contrast   = means["porn"]    - neutral
-gore_contrast   = means["gore"]    - neutral
-kiss_contrast   = means["kissing"] - neutral
-porn_specific   = porn_contrast    - gore_contrast
-gore_specific   = gore_contrast    - porn_contrast
-porn_no_romance = porn_contrast    - kiss_contrast
-shared_arousal  = np.minimum(porn_contrast, gore_contrast)
+# Low-arousal neutral (valence/reward controls)
+neutral_low    = np.stack([means["cute"], means["nature"], means["food"]]).mean(axis=0)
+
+# High-arousal neutral (motion/salience/threat controls — matched to porn+gore energy)
+neutral_high   = np.stack([means["chase"], means["fight"]]).mean(axis=0)
+
+porn_contrast       = means["porn"]    - neutral_low
+gore_contrast       = means["gore"]    - neutral_low
+kiss_contrast       = means["kissing"] - neutral_low
+
+# Motion-corrected: subtract high-arousal neutral to remove salience/motion confound
+porn_motion_corr    = means["porn"]    - neutral_high
+gore_motion_corr    = means["gore"]    - neutral_high
+
+# Specificity
+porn_specific       = porn_contrast    - gore_contrast
+gore_specific       = gore_contrast    - porn_contrast
+porn_no_romance     = porn_contrast    - kiss_contrast
+shared_arousal      = np.minimum(porn_contrast, gore_contrast)
+
+# Motion-corrected specificity (cleaner separation)
+porn_specific_mc    = porn_motion_corr - gore_motion_corr
+gore_specific_mc    = gore_motion_corr - porn_motion_corr
 
 CONTRASTS = {
-    "Porn contrast":     porn_contrast,
-    "Gore contrast":     gore_contrast,
-    "Kissing contrast":  kiss_contrast,
-    "Porn specific":     porn_specific,
-    "Gore specific":     gore_specific,
-    "Porn (no romance)": porn_no_romance,
-    "Shared arousal":    shared_arousal,
-    "Neutral baseline":  neutral,
+    "Porn contrast":          porn_contrast,
+    "Gore contrast":          gore_contrast,
+    "Kissing contrast":       kiss_contrast,
+    "Porn specific":          porn_specific,
+    "Gore specific":          gore_specific,
+    "Porn (no romance)":      porn_no_romance,
+    "Shared arousal":         shared_arousal,
+    "Porn (motion-corrected)": porn_motion_corr,
+    "Gore (motion-corrected)": gore_motion_corr,
+    "Porn specific (MC)":     porn_specific_mc,
+    "Gore specific (MC)":     gore_specific_mc,
+    "Neutral (low arousal)":  neutral_low,
+    "Neutral (high arousal)": neutral_high,
 }
 
 # ── Save vertex masks ─────────────────────────────────────────────────────────
@@ -49,9 +74,9 @@ mask_dir = STUDY_ROOT / "masks"
 mask_dir.mkdir(exist_ok=True)
 for name, data in CONTRASTS.items():
     mask = make_mask(data)
-    fname = name.lower().replace(" ", "_").replace("(", "").replace(")", "") + ".npy"
+    fname = name.lower().replace(" ", "_").replace("(", "").replace(")", "").replace("-", "_") + ".npy"
     np.save(mask_dir / fname, mask)
-    print(f"  {name:25s}  {mask.sum():5d} vertices  (LH={mask[:10242].sum()}, RH={mask[10242:].sum()})")
+    print(f"  {name:30s}  {mask.sum():5d} vertices  (LH={mask[:10242].sum()}, RH={mask[10242:].sum()})")
 
 print(f"\nMasks saved to {mask_dir}")
 
@@ -65,8 +90,6 @@ offset = lh_coords[:, 0].max() - rh_coords[:, 0].min() + 20
 rh_coords_offset = rh_coords.copy()
 rh_coords_offset[:, 0] += offset
 
-# ── Sulcal depth ──────────────────────────────────────────────────────────────
-
 lh_sulc = surface.load_surf_data(fsaverage["sulc_left"])
 rh_sulc = surface.load_surf_data(fsaverage["sulc_right"])
 
@@ -76,18 +99,16 @@ def normalize(x):
 lh_sulc = normalize(lh_sulc)
 rh_sulc = normalize(rh_sulc)
 
-# ── Blend sulcal gray + activation into vertexcolor ───────────────────────────
+# ── Blend activation onto sulcal gray ────────────────────────────────────────
 
 hot = plt.get_cmap("hot")
 
 def blend_activation_onto_sulc(sulc_norm, activation, threshold_pct=85):
     thresh = np.nanpercentile(np.abs(activation), threshold_pct)
     vmax   = np.nanpercentile(np.abs(activation), 99)
-
     r_base = (120 + sulc_norm * 100).astype(float)
     g_base = (120 + sulc_norm * 100).astype(float)
     b_base = (120 + sulc_norm * 100).astype(float)
-
     colors = []
     for idx in range(len(sulc_norm)):
         val = activation[idx]
@@ -142,16 +163,13 @@ for cname, cdata in CONTRASTS.items():
     dropdown_buttons.append(dict(
         label=cname,
         method="restyle",
-        args=[
-            {"vertexcolor": [lh_vc, rh_vc]},
-            [0, 1],
-        ],
+        args=[{"vertexcolor": [lh_vc, rh_vc]}, [0, 1]],
     ))
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 
 fig.update_layout(
-    title=dict(text="TRIBE v2 — Contrast Maps", font=dict(color="white", size=16)),
+    title=dict(text="TRIBE v2 — Contrast Maps (8 categories)", font=dict(color="white", size=16)),
     updatemenus=[dict(
         type="dropdown",
         buttons=dropdown_buttons,
@@ -164,12 +182,11 @@ fig.update_layout(
     )],
     annotations=[dict(
         text=(
-            "<b>Porn contrast</b>: porn − neutral  |  "
-            "<b>Gore contrast</b>: gore − neutral  |  "
-            "<b>Porn specific</b>: porn − gore  |  "
-            "<b>Gore specific</b>: gore − porn  |  "
-            "<b>Porn (no romance)</b>: porn − kissing  |  "
-            "<b>Shared arousal</b>: both porn+gore"
+            "<b>MC</b> = motion-corrected (chase+fight subtracted) | "
+            "<b>Porn specific</b>: porn−gore | "
+            "<b>Gore specific</b>: gore−porn | "
+            "<b>Porn (no romance)</b>: porn−kissing | "
+            "<b>Shared arousal</b>: min(porn,gore)"
         ),
         x=0.0, y=-0.06, xref="paper", yref="paper",
         showarrow=False, font=dict(color="#aaa", size=10), align="left",
