@@ -99,146 +99,50 @@ for vp in val_videos:
         baseline_preds[stem] = preds[:30]
         torch.cuda.empty_cache(); gc.collect()
 
+# ── Phase 2: monkeypatch V-JEPA2 class to inject abliterated weights ──────────
+# The neuralset extractor ignores the Python model object we patch in memory.
+# Instead it creates a FRESH V-JEPA2 instance during each predict() call.
+# Solution: patch the CLASS __init__ so every new instance auto-loads our
+# abliterated weights immediately after the normal initialisation.
+
+print("\nSetting up V-JEPA2 monkeypatch...")
+
+# Get the exact class the extractor will instantiate (same class used in model_base)
+vjepa2_cls = type(model_base.data.video_feature.image.model.model)
+print(f"  V-JEPA2 class: {vjepa2_cls.__module__}.{vjepa2_cls.__name__}")
+
+vjepa2_abl_state = torch.load(OUT_DIR / "vjepa2_abliterated.pt", map_location="cpu")
+
+_original_init = vjepa2_cls.__init__
+
+def _abliterated_init(self, *args, **kwargs):
+    _original_init(self, *args, **kwargs)
+    # After normal init, inject abliterated weights
+    missing, unexpected = self.load_state_dict(vjepa2_abl_state, strict=False)
+    if missing:
+        print(f"  [MONKEYPATCH] {len(missing)} keys missing in abliterated state dict")
+    if unexpected:
+        print(f"  [MONKEYPATCH] {len(unexpected)} unexpected keys")
+    print(f"  [MONKEYPATCH] Abliterated weights injected into new {vjepa2_cls.__name__} instance")
+
+vjepa2_cls.__init__ = _abliterated_init
+print("  Monkeypatch active — any new V-JEPA2 instance will use abliterated weights")
+
 del model_base
 torch.cuda.empty_cache(); gc.collect()
 
-# ── Phase 2: locate V-JEPA2 weights on disk ───────────────────────────────────
-# The neuralset video extractor loads V-JEPA2 from the HF hub cache, not from
-# ./cache (which is neuralset's feature/prediction cache, not model weights).
-# We scan the HF hub for facebook/vjepa2* model repos and look for .pt/.bin
-# or .safetensors shards.
-#
-# If this still fails, set vjepa2_cache_file manually below and re-run.
+# ── Phase 3: load abliterated model + run inference ───────────────────────────
 
-VJEPA2_CACHE_FILE_OVERRIDE = None   # e.g. Path("/home/research/.cache/.../model.pt")
+print("\nLoading abliterated model (fresh V-JEPA2 instances will use patched weights)...")
+model_abl = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
+print("Model loaded.\n")
 
-vjepa2_state = torch.load(OUT_DIR / "vjepa2_abliterated.pt", map_location="cpu")
+gore_mask = np.load(OUT_DIR / "gore_mask.npy")
+porn_mask = np.load(OUT_DIR / "porn_mask.npy")
 
-vjepa2_cache_file = VJEPA2_CACHE_FILE_OVERRIDE
-
-if vjepa2_cache_file is None:
-    print("\nScanning HF hub cache for V-JEPA2 weights...")
-    hf_hub = Path(os.environ.get(
-        "HUGGINGFACE_HUB_CACHE",
-        os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface" / "hub"))
-    ))
-
-    # Prefer facebook/vjepa2* repos first, then fall back to any large .pt file
-    vjepa2_dirs = [d for d in hf_hub.iterdir()
-                   if d.is_dir() and "vjepa2" in d.name.lower()] if hf_hub.exists() else []
-
-    print(f"  HF hub: {hf_hub}")
-    print(f"  V-JEPA2 repos found: {[d.name for d in vjepa2_dirs]}")
-
-    # Collect all weight files (.pt, .bin, .safetensors) from those repos
-    weight_exts = {".pt", ".bin", ".safetensors"}
-    candidates = []
-    for repo_dir in vjepa2_dirs:
-        for f in repo_dir.rglob("*"):
-            if f.suffix in weight_exts and f.stat().st_size > 100_000_000:
-                candidates.append(f)
-
-    # Also check TRIBEv2 repo for a bundled vjepa2 .pt
-    tribe_dirs = [d for d in hf_hub.iterdir()
-                  if d.is_dir() and "tribev2" in d.name.lower()] if hf_hub.exists() else []
-    for repo_dir in tribe_dirs:
-        for f in repo_dir.rglob("*"):
-            if f.suffix in weight_exts and "vjepa" in f.name.lower():
-                candidates.append(f)
-
-    if candidates:
-        print("  Candidate weight files:")
-        for c in candidates:
-            print(f"    {c}  ({c.stat().st_size/1e9:.2f} GB)")
-        # Pick the largest as most likely to be the full model
-        vjepa2_cache_file = max(candidates, key=lambda f: f.stat().st_size)
-        print(f"  Using: {vjepa2_cache_file}")
-    else:
-        # Last resort: list ALL large files in HF hub to help user set path manually
-        print("\n  [!] No V-JEPA2 weight files found. Large files in HF hub cache:")
-        if hf_hub.exists():
-            for f in hf_hub.rglob("*"):
-                if f.is_file() and f.stat().st_size > 500_000_000:
-                    print(f"      {f}  ({f.stat().st_size/1e9:.2f} GB)")
-        raise FileNotFoundError(
-            "Could not find V-JEPA2 weights in HF hub cache.\n"
-            "Set vjepa2_cache_file manually at the top of the script:\n"
-            "  VJEPA2_CACHE_FILE_OVERRIDE = Path('/path/to/vjepa2/weights.pt')"
-        )
-
-
-# ── Phase 3: build patched V-JEPA2 cache file ────────────────────────────────
-
-abl_vjepa2_cache = OUT_DIR / ("abl_" + vjepa2_cache_file.name)
-
-if abl_vjepa2_cache.exists():
-    print(f"\nAbliterated V-JEPA2 cache already exists — reusing: {abl_vjepa2_cache.name}")
-else:
-    print(f"\nBuilding abliterated V-JEPA2 cache file...")
-    full_ckpt = torch.load(str(vjepa2_cache_file), map_location="cpu")
-    state     = full_ckpt.get("state_dict", full_ckpt)
-    is_nested = "state_dict" in full_ckpt
-
-    # Detect prefix
-    sample_key = next(iter(vjepa2_state))
-    prefix = None
-    for ckpt_key in state:
-        if ckpt_key.endswith(sample_key):
-            prefix = ckpt_key[: -len(sample_key)]
-            break
-    if prefix is None:
-        # Try with no prefix (direct key match)
-        if sample_key in state:
-            prefix = ""
-    if prefix is None:
-        print("  Could not auto-detect prefix. Sample state keys:")
-        for k in list(state.keys())[:20]:
-            print(f"    {k}")
-        raise RuntimeError(
-            f"Cannot find V-JEPA2 prefix for key '{sample_key}'.\n"
-            "Set prefix manually."
-        )
-
-    print(f"  V-JEPA2 prefix in cache file: '{prefix}'")
-    n_updated = 0
-    for vkey, vval in vjepa2_state.items():
-        full_key = prefix + vkey
-        if full_key in state:
-            state[full_key] = vval.cpu()
-            n_updated += 1
-        else:
-            print(f"  [WARN] key not found: {full_key}")
-
-    print(f"  Updated {n_updated} / {len(vjepa2_state)} tensors")
-    if is_nested:
-        full_ckpt["state_dict"] = state
-    else:
-        full_ckpt = state
-
-    torch.save(full_ckpt, str(abl_vjepa2_cache))
-    print(f"  Saved → {abl_vjepa2_cache}  ({abl_vjepa2_cache.stat().st_size/1e9:.2f} GB)")
-    del full_ckpt, state
-    torch.cuda.empty_cache(); gc.collect()
-
-# ── Phase 4: swap V-JEPA2 weights file, run abliterated model, restore ────────
-
-vjepa2_backup = vjepa2_cache_file.with_suffix(".pt.bak")
-print(f"\nSwapping V-JEPA2 weights in cache: {vjepa2_cache_file.name} → abliterated")
-shutil.copy2(str(vjepa2_cache_file), str(vjepa2_backup))
-shutil.copy2(str(abl_vjepa2_cache), str(vjepa2_cache_file))
+results = []
 
 try:
-    # Use CACHE_BASE (not a fresh empty dir) — all other cached features stay;
-    # only the V-JEPA2 weights file on disk has been swapped.
-    print("Loading abliterated model (V-JEPA2 weights patched on disk)...")
-    model_abl = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
-    print("Abliterated model loaded.\n")
-
-
-    # ── Phase 5: abliterated inference + compare ──────────────────────────────
-
-    results = []
-
     for vp in val_videos:
         stem = vp.stem
         if stem not in baseline_preds:
@@ -282,10 +186,10 @@ try:
         })
 
 finally:
-    # Always restore original V-JEPA2 weights in cache
-    shutil.copy2(str(vjepa2_backup), str(vjepa2_cache_file))
-    vjepa2_backup.unlink()
-    print("Original V-JEPA2 weights restored in cache.")
+    # Always restore the original __init__ so the class is clean for any
+    # subsequent code or imports.
+    vjepa2_cls.__init__ = _original_init
+    print("V-JEPA2 class __init__ restored.")
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
@@ -294,16 +198,5 @@ for r in results:
     np.save(OUT_DIR / f"val_{s}_base.npy", r["preds_base"])
     np.save(OUT_DIR / f"val_{s}_abl.npy",  r["preds_abl"])
     print(f"Saved val_{s}_base.npy + val_{s}_abl.npy")
-
-# ── Cleanup ───────────────────────────────────────────────────────────────────
-
-if CACHE_ABL.exists():
-    shutil.rmtree(CACHE_ABL)
-
-abl_vjepa2 = OUT_DIR / ("abl_" + vjepa2_cache_file.name)
-if abl_vjepa2.exists():
-    size_gb = abl_vjepa2.stat().st_size / 1e9
-    print(f"\nNote: abliterated/{abl_vjepa2.name} is {size_gb:.1f} GB — kept for reproducibility.")
-    print(f"      Delete manually if tight on disk: rm abliterated/{abl_vjepa2.name}")
 
 print("\nDone.")
