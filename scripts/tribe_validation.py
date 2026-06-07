@@ -102,50 +102,70 @@ for vp in val_videos:
 del model_base
 torch.cuda.empty_cache(); gc.collect()
 
-# ── Phase 2: find V-JEPA2 weights file in cache ───────────────────────────────
-# best.ckpt is TRIBEv2's regression model (x-transformers keys).
-# V-JEPA2 has its own separate weights file — loaded by the neuralset extractor
-# from ./cache with 843 tensors. We scan for it by checking .pt/.bin files for
-# our known V-JEPA2 keys.
+# ── Phase 2: locate V-JEPA2 weights on disk ───────────────────────────────────
+# The neuralset video extractor loads V-JEPA2 from the HF hub cache, not from
+# ./cache (which is neuralset's feature/prediction cache, not model weights).
+# We scan the HF hub for facebook/vjepa2* model repos and look for .pt/.bin
+# or .safetensors shards.
+#
+# If this still fails, set vjepa2_cache_file manually below and re-run.
 
-print("\nScanning cache for V-JEPA2 weights file...")
+VJEPA2_CACHE_FILE_OVERRIDE = None   # e.g. Path("/home/research/.cache/.../model.pt")
+
 vjepa2_state = torch.load(OUT_DIR / "vjepa2_abliterated.pt", map_location="cpu")
-sample_keys  = set(list(vjepa2_state.keys())[:8])  # first 8 keys as fingerprint
 
-vjepa2_cache_file = None
-for candidate in sorted(CACHE_BASE.rglob("*.pt")) + sorted(CACHE_BASE.rglob("*.bin")):
-    try:
-        ckpt = torch.load(str(candidate), map_location="cpu")
-        if not isinstance(ckpt, dict):
-            continue
-        # Use state_dict if nested, otherwise use directly
-        state = ckpt.get("state_dict", ckpt)
-        if not isinstance(state, dict):
-            continue
-        # Check how many of our sample keys are present (with any prefix)
-        state_suffixes = {k.split(".", 1)[-1] if "." in k else k for k in state}
-        matches = sample_keys & state_suffixes
-        if len(matches) >= 4:
-            vjepa2_cache_file = candidate
-            print(f"  Found V-JEPA2 weights: {candidate.relative_to(CACHE_BASE)}  ({len(state)} tensors)")
-            break
-    except Exception:
-        continue
+vjepa2_cache_file = VJEPA2_CACHE_FILE_OVERRIDE
 
 if vjepa2_cache_file is None:
-    # Fallback: look for any large .pt file (>500 MB) — V-JEPA2-Large is ~2 GB
-    for candidate in sorted(CACHE_BASE.rglob("*.pt")):
-        if candidate.stat().st_size > 500_000_000:
-            vjepa2_cache_file = candidate
-            print(f"  Fallback: using largest .pt file: {candidate.relative_to(CACHE_BASE)}")
-            break
+    print("\nScanning HF hub cache for V-JEPA2 weights...")
+    hf_hub = Path(os.environ.get(
+        "HUGGINGFACE_HUB_CACHE",
+        os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface" / "hub"))
+    ))
 
-if vjepa2_cache_file is None:
-    raise FileNotFoundError(
-        "Could not find V-JEPA2 weights file in cache/.\n"
-        "Set vjepa2_cache_file manually:\n"
-        "  vjepa2_cache_file = Path('./cache/path/to/vjepa2.pt')"
-    )
+    # Prefer facebook/vjepa2* repos first, then fall back to any large .pt file
+    vjepa2_dirs = [d for d in hf_hub.iterdir()
+                   if d.is_dir() and "vjepa2" in d.name.lower()] if hf_hub.exists() else []
+
+    print(f"  HF hub: {hf_hub}")
+    print(f"  V-JEPA2 repos found: {[d.name for d in vjepa2_dirs]}")
+
+    # Collect all weight files (.pt, .bin, .safetensors) from those repos
+    weight_exts = {".pt", ".bin", ".safetensors"}
+    candidates = []
+    for repo_dir in vjepa2_dirs:
+        for f in repo_dir.rglob("*"):
+            if f.suffix in weight_exts and f.stat().st_size > 100_000_000:
+                candidates.append(f)
+
+    # Also check TRIBEv2 repo for a bundled vjepa2 .pt
+    tribe_dirs = [d for d in hf_hub.iterdir()
+                  if d.is_dir() and "tribev2" in d.name.lower()] if hf_hub.exists() else []
+    for repo_dir in tribe_dirs:
+        for f in repo_dir.rglob("*"):
+            if f.suffix in weight_exts and "vjepa" in f.name.lower():
+                candidates.append(f)
+
+    if candidates:
+        print("  Candidate weight files:")
+        for c in candidates:
+            print(f"    {c}  ({c.stat().st_size/1e9:.2f} GB)")
+        # Pick the largest as most likely to be the full model
+        vjepa2_cache_file = max(candidates, key=lambda f: f.stat().st_size)
+        print(f"  Using: {vjepa2_cache_file}")
+    else:
+        # Last resort: list ALL large files in HF hub to help user set path manually
+        print("\n  [!] No V-JEPA2 weight files found. Large files in HF hub cache:")
+        if hf_hub.exists():
+            for f in hf_hub.rglob("*"):
+                if f.is_file() and f.stat().st_size > 500_000_000:
+                    print(f"      {f}  ({f.stat().st_size/1e9:.2f} GB)")
+        raise FileNotFoundError(
+            "Could not find V-JEPA2 weights in HF hub cache.\n"
+            "Set vjepa2_cache_file manually at the top of the script:\n"
+            "  VJEPA2_CACHE_FILE_OVERRIDE = Path('/path/to/vjepa2/weights.pt')"
+        )
+
 
 # ── Phase 3: build patched V-JEPA2 cache file ────────────────────────────────
 
