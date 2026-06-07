@@ -138,6 +138,49 @@ print("  Monkeypatch active — any new V-JEPA2 instance will use abliterated we
 del model_base
 torch.cuda.empty_cache(); gc.collect()
 
+# ── Clear exca cache for val videos before abliterated run ───────────────────
+
+import json
+
+print("\nClearing exca cache for val videos...")
+
+val_resolved = {str(vp.resolve()) for vp in val_videos}
+
+for info_file in CACHE_BASE.rglob("*info.jsonl"):
+    try:
+        lines = info_file.read_text().strip().splitlines()
+        val_lines    = [l for l in lines if any(v in l for v in val_resolved)]
+        nonval_lines = [l for l in lines if not any(v in l for v in val_resolved)]
+
+        if not val_lines:
+            continue
+
+        print(f"  Found {len(val_lines)} val entries in {info_file.name}")
+
+        for line in val_lines:
+            entry     = json.loads(line)
+            data_file = info_file.parent / entry["data"]["filename"]
+            offset    = entry["data"]["offset"]
+            shape     = entry["data"]["shape"]
+            n_bytes   = int(np.prod(shape)) * 4
+
+            if data_file.exists():
+                mm = np.memmap(data_file, dtype="float32", mode="r+",
+                               shape=tuple(shape), offset=offset)
+                mm[:] = 0.0
+                mm.flush()
+                del mm
+                print(f"  Zeroed {data_file.name} offset={offset} shape={shape}")
+
+        # Remove val entries from index so exca re-registers and recomputes
+        info_file.write_text("\n".join(nonval_lines) + ("\n" if nonval_lines else ""))
+        print(f"  Cleaned index: {info_file.name}")
+
+    except Exception as e:
+        print(f"  [ERROR] {info_file}: {e}")
+
+print("Cache cleared — abliterated model will recompute features from scratch\n")
+
 # ── Phase 3: load abliterated model + run inference ───────────────────────────
 
 print("\nLoading abliterated model (fresh V-JEPA2 instances will use patched weights)...")
