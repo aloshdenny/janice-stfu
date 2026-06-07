@@ -41,6 +41,10 @@ gore_specific = gore_contrast - porn_contrast
 porn_tight = means["porn"] - np.stack([means["kissing"], means["chase"]]).mean(axis=0)
 gore_tight  = means["gore"] - np.stack([means["fight"],  means["chase"]]).mean(axis=0)
 
+porn_no_food = means["porn"] - np.stack([
+    means["kissing"], means["chase"], means["food"]
+]).mean(axis=0)
+
 CONTRASTS = {
     "porn_allneutral":  porn_contrast,
     "gore_allneutral":  gore_contrast,
@@ -48,6 +52,7 @@ CONTRASTS = {
     "gore_specific":    gore_specific,
     "porn_tight":       porn_tight,
     "gore_tight":       gore_tight,
+    "porn_no_food":     porn_no_food,
 }
 
 # ── Stricter masking: require top 10% AND positive ─────────────────────────
@@ -93,7 +98,7 @@ for cat in CATEGORIES:
 print("\nSelectivity score (target activation - mean of all other categories):")
 for target_cat, mask_name in [("porn", "porn_specific"), ("gore", "gore_specific"),
                                ("porn", "porn_tight"),    ("gore", "gore_tight"),
-                               ("porn", "porn_allneutral"),("gore","gore_allneutral")]:
+                               ("porn", "porn_allneutral"),("gore","gore_allneutral"),("porn", "porn_no_food")]:
     mask = new_masks[mask_name]
     if mask.sum() == 0:
         continue

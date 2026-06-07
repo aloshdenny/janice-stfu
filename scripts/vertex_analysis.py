@@ -207,3 +207,92 @@ fig.update_layout(
 out_html = STUDY_ROOT / "contrast_maps.html"
 fig.write_html(str(out_html))
 print(f"\nSaved → {out_html}")
+
+# ── Save static snapshots ─────────────────────────────────────────────────────
+
+contrast_dir = STUDY_ROOT / "contrast_maps"
+contrast_dir.mkdir(exist_ok=True)
+
+for cname, cdata in CONTRASTS.items():
+
+    lh_vc, rh_vc = make_vertexcolors(cdata)
+
+    snap = go.Figure()
+
+    snap.add_trace(go.Mesh3d(
+        x=lh_coords[:, 0],
+        y=lh_coords[:, 1],
+        z=lh_coords[:, 2],
+        i=lh_faces[:, 0],
+        j=lh_faces[:, 1],
+        k=lh_faces[:, 2],
+        vertexcolor=lh_vc,
+        lighting=lighting,
+        lightposition=lightposition,
+        hoverinfo="skip",
+        showscale=False,
+    ))
+
+    snap.add_trace(go.Mesh3d(
+        x=rh_coords_offset[:, 0],
+        y=rh_coords_offset[:, 1],
+        z=rh_coords_offset[:, 2],
+        i=rh_faces[:, 0],
+        j=rh_faces[:, 1],
+        k=rh_faces[:, 2],
+        vertexcolor=rh_vc,
+        lighting=lighting,
+        lightposition=lightposition,
+        hoverinfo="skip",
+        showscale=False,
+    ))
+
+    snap.update_layout(
+        scene=dict(
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+            bgcolor="black",
+            camera=dict(
+                eye=dict(x=0, y=-2.0, z=0.5)
+            ),
+        ),
+        paper_bgcolor="black",
+        margin=dict(l=0, r=0, t=0, b=0),
+        width=1600,
+        height=1000,
+    )
+
+    snap.add_annotation(
+        text=f"<b>{cname}</b>",
+        x=0.985,
+        y=0.02,
+        xref="paper",
+        yref="paper",
+        xanchor="right",
+        yanchor="bottom",
+        showarrow=False,
+        font=dict(
+            size=32,
+            color="white"
+        ),
+    )
+
+    fname = (
+        cname.lower()
+        .replace(" ", "_")
+        .replace("(", "")
+        .replace(")", "")
+        .replace("-", "_")
+        + ".png"
+    )
+
+    out_file = contrast_dir / fname
+
+    snap.write_image(
+        str(out_file),
+        scale=2,  # high-res
+        engine="kaleido"
+    )
+
+    print("Saved:", out_file)
