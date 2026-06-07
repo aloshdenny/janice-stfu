@@ -28,8 +28,8 @@ GORE_MASK_FILE = MASK_DIR / "gore_allneutral_strict.npy"
 PORN_MASK_FILE = MASK_DIR / "porn_no_food_strict.npy"
 
 CATEGORIES = {
-    "gore": [f"gore{i}.mp4" for i in range(1, 9)],
-    "porn": [f"porn{i}.mp4" for i in range(1, 5)],  # only 1-4 decodable
+    "gore": [f"gore{i}.mp4" for i in range(1, 25)],
+    "porn": [f"porn{i}.mp4" for i in range(1, 25)],
 }
 
 # ── Load model ────────────────────────────────────────────────────────────────
