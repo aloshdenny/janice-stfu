@@ -1,3 +1,11 @@
+import os
+import warnings
+import logging
+
+warnings.filterwarnings("ignore")
+logging.disable(logging.WARNING)
+os.environ["PYTHONWARNINGS"] = "ignore"
+
 import numpy as np
 from pathlib import Path
 

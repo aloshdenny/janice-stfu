@@ -1,9 +1,14 @@
-from tribev2.demo_utils import TribeModel
-from pathlib import Path
-import numpy as np
 import os
 import warnings
 import logging
+
+warnings.filterwarnings("ignore")
+logging.disable(logging.WARNING)
+os.environ["PYTHONWARNINGS"] = "ignore"
+
+from tribev2.demo_utils import TribeModel
+from pathlib import Path
+import numpy as np
 import subprocess
 import pandas as pd
 import matplotlib
@@ -48,8 +53,6 @@ def make_video_only_df(video_path: Path) -> pd.DataFrame:
         "context":   float("nan"),
     }])
 
-warnings.filterwarnings("ignore")
-logging.disable(logging.CRITICAL)
 
 CHUNK_TIMEOUT = 120
 CHUNK = 10

@@ -1,3 +1,11 @@
+import os
+import warnings
+import logging
+
+warnings.filterwarnings("ignore")
+logging.disable(logging.WARNING)
+os.environ["PYTHONWARNINGS"] = "ignore"
+
 import numpy as np
 import torch
 import pandas as pd
@@ -6,7 +14,6 @@ from tribev2.demo_utils import TribeModel
 import gc
 import shutil
 import subprocess
-import os
 
 VAL_DIR    = Path("./val_data")
 OUT_DIR    = Path("./abliterated")

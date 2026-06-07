@@ -1,10 +1,15 @@
+import os
+import warnings
+import logging
+
+warnings.filterwarnings("ignore")
+logging.disable(logging.WARNING)
+os.environ["PYTHONWARNINGS"] = "ignore"
+
 from tribev2.demo_utils import TribeModel
 from tribev2.plotting import PlotBrain
 from pathlib import Path
 import numpy as np
-import os
-import warnings
-import logging
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -12,9 +17,6 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from multiprocessing import Process, cpu_count
 import multiprocessing as mp
 import time
-
-warnings.filterwarnings("ignore")
-logging.disable(logging.CRITICAL)
 
 CHUNK_TIMEOUT = 120
 CHUNK = 10
