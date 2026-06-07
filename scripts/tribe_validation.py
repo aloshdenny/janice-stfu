@@ -102,52 +102,84 @@ for vp in val_videos:
 del model_base
 torch.cuda.empty_cache(); gc.collect()
 
-# ── Phase 2: locate best.ckpt (now guaranteed to exist after predict()) ───────
+# ── Phase 2: find V-JEPA2 weights file in cache ───────────────────────────────
+# best.ckpt is TRIBEv2's regression model (x-transformers keys).
+# V-JEPA2 has its own separate weights file — loaded by the neuralset extractor
+# from ./cache with 843 tensors. We scan for it by checking .pt/.bin files for
+# our known V-JEPA2 keys.
 
-print("\nLocating best.ckpt...")
-ckpt_path = find_ckpt()
-if ckpt_path is None or not ckpt_path.exists():
+print("\nScanning cache for V-JEPA2 weights file...")
+vjepa2_state = torch.load(OUT_DIR / "vjepa2_abliterated.pt", map_location="cpu")
+sample_keys  = set(list(vjepa2_state.keys())[:8])  # first 8 keys as fingerprint
+
+vjepa2_cache_file = None
+for candidate in sorted(CACHE_BASE.rglob("*.pt")) + sorted(CACHE_BASE.rglob("*.bin")):
+    try:
+        ckpt = torch.load(str(candidate), map_location="cpu")
+        if not isinstance(ckpt, dict):
+            continue
+        # Use state_dict if nested, otherwise use directly
+        state = ckpt.get("state_dict", ckpt)
+        if not isinstance(state, dict):
+            continue
+        # Check how many of our sample keys are present (with any prefix)
+        state_suffixes = {k.split(".", 1)[-1] if "." in k else k for k in state}
+        matches = sample_keys & state_suffixes
+        if len(matches) >= 4:
+            vjepa2_cache_file = candidate
+            print(f"  Found V-JEPA2 weights: {candidate.relative_to(CACHE_BASE)}  ({len(state)} tensors)")
+            break
+    except Exception:
+        continue
+
+if vjepa2_cache_file is None:
+    # Fallback: look for any large .pt file (>500 MB) — V-JEPA2-Large is ~2 GB
+    for candidate in sorted(CACHE_BASE.rglob("*.pt")):
+        if candidate.stat().st_size > 500_000_000:
+            vjepa2_cache_file = candidate
+            print(f"  Fallback: using largest .pt file: {candidate.relative_to(CACHE_BASE)}")
+            break
+
+if vjepa2_cache_file is None:
     raise FileNotFoundError(
-        "Could not locate best.ckpt in HF hub cache after running baseline inference.\n"
-        "Set ckpt_path manually at the top of the script:\n"
-        "  ckpt_path = Path('/path/to/best.ckpt')"
+        "Could not find V-JEPA2 weights file in cache/.\n"
+        "Set vjepa2_cache_file manually:\n"
+        "  vjepa2_cache_file = Path('./cache/path/to/vjepa2.pt')"
     )
-print(f"  Found: {ckpt_path}")
 
-# ── Phase 3: build abliterated checkpoint ─────────────────────────────────────
+# ── Phase 3: build patched V-JEPA2 cache file ────────────────────────────────
 
-abl_ckpt_path = OUT_DIR / "best_abliterated.ckpt"
+abl_vjepa2_cache = OUT_DIR / ("abl_" + vjepa2_cache_file.name)
 
-# Skip rebuild if already done (saves ~5 min of torch.save time)
-if abl_ckpt_path.exists():
-    print(f"\nAbliterated checkpoint already exists ({abl_ckpt_path.stat().st_size/1e9:.2f} GB) — reusing.")
+if abl_vjepa2_cache.exists():
+    print(f"\nAbliterated V-JEPA2 cache already exists — reusing: {abl_vjepa2_cache.name}")
 else:
-    print("\nBuilding abliterated checkpoint...")
-    full_ckpt = torch.load(str(ckpt_path), map_location="cpu")
-    state = full_ckpt.get("state_dict", full_ckpt)
+    print(f"\nBuilding abliterated V-JEPA2 cache file...")
+    full_ckpt = torch.load(str(vjepa2_cache_file), map_location="cpu")
+    state     = full_ckpt.get("state_dict", full_ckpt)
+    is_nested = "state_dict" in full_ckpt
 
-    vjepa2_state = torch.load(OUT_DIR / "vjepa2_abliterated.pt", map_location="cpu")
-
-    # Auto-detect the checkpoint key prefix for V-JEPA2 params
+    # Detect prefix
     sample_key = next(iter(vjepa2_state))
     prefix = None
     for ckpt_key in state:
         if ckpt_key.endswith(sample_key):
             prefix = ckpt_key[: -len(sample_key)]
             break
-
     if prefix is None:
-        frag = sample_key.split(".")[0]
-        print(f"  Could not auto-detect prefix. Keys containing '{frag}':")
-        for k in state:
-            if frag in k:
-                print(f"    {k}")
+        # Try with no prefix (direct key match)
+        if sample_key in state:
+            prefix = ""
+    if prefix is None:
+        print("  Could not auto-detect prefix. Sample state keys:")
+        for k in list(state.keys())[:20]:
+            print(f"    {k}")
         raise RuntimeError(
-            f"Cannot find V-JEPA2 prefix in checkpoint for key '{sample_key}'.\n"
-            "Set prefix manually and re-run."
+            f"Cannot find V-JEPA2 prefix for key '{sample_key}'.\n"
+            "Set prefix manually."
         )
 
-    print(f"  V-JEPA2 prefix: '{prefix}'")
+    print(f"  V-JEPA2 prefix in cache file: '{prefix}'")
     n_updated = 0
     for vkey, vval in vjepa2_state.items():
         full_key = prefix + vkey
@@ -157,33 +189,31 @@ else:
         else:
             print(f"  [WARN] key not found: {full_key}")
 
-    print(f"  Updated {n_updated} / {len(vjepa2_state)} V-JEPA2 tensors")
-
-    if "state_dict" in full_ckpt:
+    print(f"  Updated {n_updated} / {len(vjepa2_state)} tensors")
+    if is_nested:
         full_ckpt["state_dict"] = state
     else:
         full_ckpt = state
 
-    torch.save(full_ckpt, str(abl_ckpt_path))
-    print(f"  Saved → {abl_ckpt_path}  ({abl_ckpt_path.stat().st_size/1e9:.2f} GB)")
-    del full_ckpt, state, vjepa2_state
+    torch.save(full_ckpt, str(abl_vjepa2_cache))
+    print(f"  Saved → {abl_vjepa2_cache}  ({abl_vjepa2_cache.stat().st_size/1e9:.2f} GB)")
+    del full_ckpt, state
     torch.cuda.empty_cache(); gc.collect()
 
-# ── Phase 4: swap checkpoint, load abliterated model, restore ─────────────────
+# ── Phase 4: swap V-JEPA2 weights file, run abliterated model, restore ────────
 
-ckpt_backup = ckpt_path.with_suffix(".ckpt.bak")
-print(f"\nSwapping {ckpt_path.name} → abliterated version...")
-shutil.copy2(str(ckpt_path), str(ckpt_backup))
-shutil.copy2(str(abl_ckpt_path), str(ckpt_path))
+vjepa2_backup = vjepa2_cache_file.with_suffix(".pt.bak")
+print(f"\nSwapping V-JEPA2 weights in cache: {vjepa2_cache_file.name} → abliterated")
+shutil.copy2(str(vjepa2_cache_file), str(vjepa2_backup))
+shutil.copy2(str(abl_vjepa2_cache), str(vjepa2_cache_file))
 
 try:
-    if CACHE_ABL.exists():
-        shutil.rmtree(CACHE_ABL)
-    CACHE_ABL.mkdir(parents=True)
-
-    print("Loading abliterated model (from patched checkpoint)...")
-    model_abl = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_ABL)
+    # Use CACHE_BASE (not a fresh empty dir) — all other cached features stay;
+    # only the V-JEPA2 weights file on disk has been swapped.
+    print("Loading abliterated model (V-JEPA2 weights patched on disk)...")
+    model_abl = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
     print("Abliterated model loaded.\n")
+
 
     # ── Phase 5: abliterated inference + compare ──────────────────────────────
 
@@ -232,10 +262,10 @@ try:
         })
 
 finally:
-    # Always restore original checkpoint
-    shutil.copy2(str(ckpt_backup), str(ckpt_path))
-    ckpt_backup.unlink()
-    print("Original checkpoint restored.")
+    # Always restore original V-JEPA2 weights in cache
+    shutil.copy2(str(vjepa2_backup), str(vjepa2_cache_file))
+    vjepa2_backup.unlink()
+    print("Original V-JEPA2 weights restored in cache.")
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
@@ -248,9 +278,12 @@ for r in results:
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 
 if CACHE_ABL.exists():
-    print(f"\nRemoving temporary cache_abliterated...")
     shutil.rmtree(CACHE_ABL)
 
-print(f"\nNote: abliterated/best_abliterated.ckpt kept for reproducibility.")
-print("      Delete manually if disk space is tight: rm abliterated/best_abliterated.ckpt")
+abl_vjepa2 = OUT_DIR / ("abl_" + vjepa2_cache_file.name)
+if abl_vjepa2.exists():
+    size_gb = abl_vjepa2.stat().st_size / 1e9
+    print(f"\nNote: abliterated/{abl_vjepa2.name} is {size_gb:.1f} GB — kept for reproducibility.")
+    print(f"      Delete manually if tight on disk: rm abliterated/{abl_vjepa2.name}")
+
 print("\nDone.")
