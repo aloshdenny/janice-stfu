@@ -163,7 +163,7 @@ gc.collect()
 
 # ── Weighted PCA ──────────────────────────────────────────────────────────────
 
-def find_directions(X, y, n_components=3, label=""):
+def find_directions(X, y, n_components=1, label=""):  # reduce to 1 component
     weights  = (y - y.min()) / (y.max() - y.min() + 1e-9)
     weights /= weights.sum()
     X_mean   = (X * weights[:, None]).sum(axis=0, keepdims=True)
@@ -171,7 +171,19 @@ def find_directions(X, y, n_components=3, label=""):
     _, S, Vt = np.linalg.svd(X_c, full_matrices=False)
     print(f"  [{label}] singular values: {S[:5].round(4)}")
     print(f"  [{label}] explained variance ratio: {(S[:3]**2 / (S**2).sum()).round(3)}")
-    return Vt[:n_components]
+
+    directions = Vt[:n_components]
+
+    # Fix sign: ensure direction correlates positively with y
+    # i.e. high-y samples should have positive projection onto direction
+    for i in range(n_components):
+        proj = X @ directions[i]
+        corr = float(np.corrcoef(proj, y)[0, 1])
+        if corr < 0:
+            directions[i] *= -1
+            print(f"  [{label}] flipped direction {i} (was negatively correlated)")
+
+    return directions
 
 
 print("\nComputing directions...")
@@ -223,8 +235,6 @@ def make_gs_hook(directions_np):
 # ── Weight surgery (permanent) ────────────────────────────────────────────────
 
 def apply_weight_surgery():
-    print("\nApplying weight surgery...")
-
     all_dirs = np.concatenate([gore_dirs, porn_dirs], axis=0)
     dirs_t   = torch.tensor(all_dirs, dtype=torch.float32).to(DEVICE)
 
@@ -237,20 +247,20 @@ def apply_weight_surgery():
     ortho = torch.stack(ortho)
 
     block = encoder_blocks[TARGET_IDX]
-    W_mod = block.attention.proj          # directly target attention.proj
-    W     = W_mod.weight.data
-    print(f"  Target: block[{TARGET_IDX}].attention.proj  {W.shape}")
 
-    for q in ortho:
-        W -= (W @ q).unsqueeze(-1) * q
-    W_mod.weight.data = W
+    # Project out of both value projection (input) and output projection
+    for layer_name in ["attention.value", "attention.proj"]:
+        mod = block
+        for p in layer_name.split("."):
+            mod = getattr(mod, p)
+        W = mod.weight.data
+        print(f"  Surgery on block[{TARGET_IDX}].{layer_name}  {W.shape}")
+        for q in ortho:
+            W -= (W @ q).unsqueeze(-1) * q
+        mod.weight.data = W
 
-    out_path = OUT_DIR / "vjepa2_abliterated.pt"
-    torch.save(vjepa2_module.state_dict(), out_path)
-    print(f"  Saved → {out_path}")
-
-    # Verify file was written
-    print(f"  File size: {out_path.stat().st_size / 1e6:.1f} MB")
-
+    torch.save(vjepa2_module.state_dict(), OUT_DIR / "vjepa2_abliterated.pt")
+    print(f"  Saved → {OUT_DIR / 'vjepa2_abliterated.pt'}")
+    print(f"  File size: {(OUT_DIR / 'vjepa2_abliterated.pt').stat().st_size / 1e6:.1f} MB")
 
 apply_weight_surgery()
