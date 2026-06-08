@@ -32,7 +32,7 @@ IMG_SIZE      = 256
 
 # Gore: strong selective signal (+0.1516)
 # Porn: weak but best available (+0.0455) — will suppress body/skin representation
-GORE_MASK_FILE = MASK_DIR / "gore_allneutral_strict.npy"
+GORE_MASK_FILE = MASK_DIR / "gore_no_food_strict.npy"
 PORN_MASK_FILE = MASK_DIR / "porn_no_food_strict.npy"
 
 CATEGORIES = {

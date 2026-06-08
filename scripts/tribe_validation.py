@@ -135,51 +135,41 @@ def _abliterated_init(self, *args, **kwargs):
 vjepa2_cls.__init__ = _abliterated_init
 print("  Monkeypatch active — any new V-JEPA2 instance will use abliterated weights")
 
-del model_base
-torch.cuda.empty_cache(); gc.collect()
-
-# ── Clear exca cache for val videos before abliterated run ───────────────────
-
-import json
+# ── Clear exca cache for val videos before deleting model_base ────────────────
 
 print("\nClearing exca cache for val videos...")
+cache_dict = model_base.data.video_feature.infra.cache_dict
+item_uid = model_base.data.video_feature.infra.item_uid
+helper = model_base.data.video_feature._event_types_helper
 
-val_resolved = {str(vp.resolve()) for vp in val_videos}
+# Force population of cache keys by calling keys() or __contains__
+all_keys = list(cache_dict.keys())
+print(f"  Total keys currently in cache_dict: {len(all_keys)}")
+if len(all_keys) > 0:
+    print(f"  Sample cache keys: {all_keys[:5]}")
 
-for info_file in CACHE_BASE.rglob("*info.jsonl"):
-    try:
-        lines = info_file.read_text().strip().splitlines()
-        val_lines    = [l for l in lines if any(v in l for v in val_resolved)]
-        nonval_lines = [l for l in lines if not any(v in l for v in val_resolved)]
+for vp in val_videos:
+    df = make_video_only_df(vp)
+    events = helper.extract(df)
+    for event in events:
+        key = item_uid(event)
+        print(f"  Checking validation key: {key}")
+        if key in cache_dict:
+            print(f"    -> Found! Deleting cache key: {key}")
+            del cache_dict[key]
+            # Confirm deletion
+            if key not in cache_dict:
+                print(f"    -> Verified deleted from cache_dict")
+            else:
+                print(f"    -> WARNING: Failed to delete from cache_dict!")
+        else:
+            print(f"    -> Key not found in cache_dict")
 
-        if not val_lines:
-            continue
-
-        print(f"  Found {len(val_lines)} val entries in {info_file.name}")
-
-        for line in val_lines:
-            entry     = json.loads(line)
-            data_file = info_file.parent / entry["data"]["filename"]
-            offset    = entry["data"]["offset"]
-            shape     = entry["data"]["shape"]
-            n_bytes   = int(np.prod(shape)) * 4
-
-            if data_file.exists():
-                mm = np.memmap(data_file, dtype="float32", mode="r+",
-                               shape=tuple(shape), offset=offset)
-                mm[:] = 0.0
-                mm.flush()
-                del mm
-                print(f"  Zeroed {data_file.name} offset={offset} shape={shape}")
-
-        # Remove val entries from index so exca re-registers and recomputes
-        info_file.write_text("\n".join(nonval_lines) + ("\n" if nonval_lines else ""))
-        print(f"  Cleaned index: {info_file.name}")
-
-    except Exception as e:
-        print(f"  [ERROR] {info_file}: {e}")
-
+print(f"  Total keys in cache_dict after deletion: {len(list(cache_dict.keys()))}")
 print("Cache cleared — abliterated model will recompute features from scratch\n")
+
+del model_base
+torch.cuda.empty_cache(); gc.collect()
 
 # ── Phase 3: load abliterated model + run inference ───────────────────────────
 

@@ -53,6 +53,10 @@ porn_no_food = means["porn"] - np.stack([
     means["kissing"], means["chase"], means["food"]
 ]).mean(axis=0)
 
+gore_no_food = means["gore"] - np.stack([
+    means["cute"], means["nature"], means["kissing"], means["chase"], means["fight"]
+]).mean(axis=0)
+
 CONTRASTS = {
     "porn_allneutral":  porn_contrast,
     "gore_allneutral":  gore_contrast,
@@ -61,6 +65,7 @@ CONTRASTS = {
     "porn_tight":       porn_tight,
     "gore_tight":       gore_tight,
     "porn_no_food":     porn_no_food,
+    "gore_no_food":     gore_no_food,
 }
 
 # ── Stricter masking: require top 10% AND positive ─────────────────────────
@@ -106,7 +111,8 @@ for cat in CATEGORIES:
 print("\nSelectivity score (target activation - mean of all other categories):")
 for target_cat, mask_name in [("porn", "porn_specific"), ("gore", "gore_specific"),
                                ("porn", "porn_tight"),    ("gore", "gore_tight"),
-                               ("porn", "porn_allneutral"),("gore","gore_allneutral"),("porn", "porn_no_food")]:
+                               ("porn", "porn_allneutral"),("gore","gore_allneutral"),
+                               ("porn", "porn_no_food"),   ("gore", "gore_no_food")]:
     mask = new_masks[mask_name]
     if mask.sum() == 0:
         continue
@@ -115,6 +121,19 @@ for target_cat, mask_name in [("porn", "porn_specific"), ("gore", "gore_specific
     other_val   = float(np.stack([means[c][mask] for c in other_cats]).mean())
     score       = target_val - other_val
     print(f"  {target_cat:6s} in {mask_name:20s}: target={target_val:.4f}  others={other_val:.4f}  score={score:+.4f}")
+
+# ── Food selectivity sanity check ─────────────────────────────────────────
+if "gore_no_food" in new_masks:
+    gore_mask_to_check = new_masks["gore_no_food"]
+    gore_act = float(means["gore"][gore_mask_to_check].mean())
+    food_act = float(means["food"][gore_mask_to_check].mean())
+    print("\nFood selectivity sanity check for gore_no_food:")
+    print(f"  Gore activation in Gore mask: {gore_act:.4f}")
+    print(f"  Food activation in Gore mask: {food_act:.4f}")
+    if food_act >= gore_act:
+        print("  WARNING: Food activation is HIGHER than or equal to Gore activation in the Gore mask!")
+    else:
+        print("  ✓ Sanity check passed: Food activation is lower than Gore activation in the Gore mask.")
 
 # ── Save best masks ────────────────────────────────────────────────────────
 MASK_DIR.mkdir(exist_ok=True)
