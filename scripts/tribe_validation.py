@@ -120,13 +120,23 @@ print("  [ACTIVE INSTANCE] Abliterated weights injected directly into loaded mod
 
 # Set up class monkeypatch in case fresh instances are created during predict()
 _original_init = vjepa2_cls.__init__
+_original_from_pretrained = getattr(vjepa2_cls, "from_pretrained", None)
 
 def _abliterated_init(self, *args, **kwargs):
     _original_init(self, *args, **kwargs)
     self.load_state_dict(vjepa2_abl_state, strict=False)
-    print(f"  [MONKEYPATCH] Abliterated weights injected into new {vjepa2_cls.__name__} instance")
+    print(f"  [MONKEYPATCH] Abliterated weights injected into new {vjepa2_cls.__name__} instance via __init__")
+
+@classmethod
+def _abliterated_from_pretrained(cls, *args, **kwargs):
+    model = _original_from_pretrained(*args, **kwargs)
+    model.load_state_dict(vjepa2_abl_state, strict=False)
+    print(f"  [MONKEYPATCH] Abliterated weights injected into new {vjepa2_cls.__name__} instance via from_pretrained")
+    return model
 
 vjepa2_cls.__init__ = _abliterated_init
+if _original_from_pretrained is not None:
+    vjepa2_cls.from_pretrained = _abliterated_from_pretrained
 print("  Monkeypatch active — any new V-JEPA2 instance will use abliterated weights")
 
 # ── Clear exca cache for val videos on model_abl ──────────────────────────────
@@ -235,10 +245,12 @@ try:
         })
 
 finally:
-    # Always restore the original __init__ so the class is clean for any
+    # Always restore the original __init__ and from_pretrained so the class is clean for any
     # subsequent code or imports.
     vjepa2_cls.__init__ = _original_init
-    print("V-JEPA2 class __init__ restored.")
+    if _original_from_pretrained is not None:
+        vjepa2_cls.from_pretrained = _original_from_pretrained
+    print("V-JEPA2 class monkeypatches restored.")
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
