@@ -73,20 +73,16 @@ gore_mask = np.load(OUT_DIR / "gore_mask.npy")
 porn_mask = np.load(OUT_DIR / "porn_mask.npy")
 
 # ── Phase 1: baseline inference ───────────────────────────────────────────────
-# Running predict() here has the side effect of downloading best.ckpt to the
-# HF hub cache, which we need in Phase 2 to build the abliterated checkpoint.
+# Load baseline preds from disk (no model needed)
 
 val_videos = sorted(VAL_DIR.glob("*.mp4"))
 print(f"Found {len(val_videos)} validation videos\n")
-
-print("Loading baseline model...")
-model_base = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
 
 baseline_preds = {}   # stem → np.ndarray (30, n_verts)
 
 for vp in val_videos:
     stem = vp.stem
-    # Re-use saved preds from tribe_study if present — avoids re-running inference
+    # Re-use saved preds from tribe_study
     saved = None
     for cat_dir in STUDY_ROOT.iterdir():
         if not cat_dir.is_dir():
@@ -100,47 +96,45 @@ for vp in val_videos:
         baseline_preds[stem] = np.load(saved)[:30]
         print(f"  {vp.name}: baseline loaded from {saved.relative_to(STUDY_ROOT)}")
     else:
-        print(f"  {vp.name}: running baseline inference...")
-        df = make_video_only_df(vp)
-        preds, _ = model_base.predict(events=df)
-        baseline_preds[stem] = preds[:30]
-        torch.cuda.empty_cache(); gc.collect()
+        print(f"  [WARNING] {vp.name}: baseline preds not found on disk. Skipping.")
 
-# ── Phase 2: monkeypatch V-JEPA2 class to inject abliterated weights ──────────
-# The neuralset extractor ignores the Python model object we patch in memory.
-# Instead it creates a FRESH V-JEPA2 instance during each predict() call.
-# Solution: patch the CLASS __init__ so every new instance auto-loads our
-# abliterated weights immediately after the normal initialisation.
+# ── Phase 2: Load abliterated model & patch V-JEPA2 ───────────────────────────
 
-print("\nSetting up V-JEPA2 monkeypatch...")
+print("\nLoading abliterated model...")
+model_abl = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
+print("Model loaded.\n")
 
-# Get the exact class the extractor will instantiate (same class used in model_base)
-vjepa2_cls = type(model_base.data.video_feature.image.model.model)
+# Get V-JEPA2 class and inject abliterated weights
+vjepa2_cls = type(model_abl.data.video_feature.image.model.model)
 print(f"  V-JEPA2 class: {vjepa2_cls.__module__}.{vjepa2_cls.__name__}")
 
 vjepa2_abl_state = torch.load(OUT_DIR / "vjepa2_abliterated.pt", map_location="cpu")
 
+# Inject abliterated weights into the active instance
+missing, unexpected = model_abl.data.video_feature.image.model.model.load_state_dict(vjepa2_abl_state, strict=False)
+if missing:
+    print(f"  [ACTIVE INSTANCE] {len(missing)} keys missing in abliterated state dict")
+if unexpected:
+    print(f"  [ACTIVE INSTANCE] {len(unexpected)} unexpected keys")
+print("  [ACTIVE INSTANCE] Abliterated weights injected directly into loaded model instance")
+
+# Set up class monkeypatch in case fresh instances are created during predict()
 _original_init = vjepa2_cls.__init__
 
 def _abliterated_init(self, *args, **kwargs):
     _original_init(self, *args, **kwargs)
-    # After normal init, inject abliterated weights
-    missing, unexpected = self.load_state_dict(vjepa2_abl_state, strict=False)
-    if missing:
-        print(f"  [MONKEYPATCH] {len(missing)} keys missing in abliterated state dict")
-    if unexpected:
-        print(f"  [MONKEYPATCH] {len(unexpected)} unexpected keys")
+    self.load_state_dict(vjepa2_abl_state, strict=False)
     print(f"  [MONKEYPATCH] Abliterated weights injected into new {vjepa2_cls.__name__} instance")
 
 vjepa2_cls.__init__ = _abliterated_init
 print("  Monkeypatch active — any new V-JEPA2 instance will use abliterated weights")
 
-# ── Clear exca cache for val videos before deleting model_base ────────────────
+# ── Clear exca cache for val videos on model_abl ──────────────────────────────
 
 print("\nClearing exca cache for val videos...")
-cache_dict = model_base.data.video_feature.infra.cache_dict
-item_uid = model_base.data.video_feature.infra.item_uid
-helper = model_base.data.video_feature._event_types_helper
+cache_dict = model_abl.data.video_feature.infra.cache_dict
+item_uid = model_abl.data.video_feature.infra.item_uid
+helper = model_abl.data.video_feature._event_types_helper
 
 # Force population of cache keys by calling keys() or __contains__
 all_keys = list(cache_dict.keys())
@@ -168,14 +162,7 @@ for vp in val_videos:
 print(f"  Total keys in cache_dict after deletion: {len(list(cache_dict.keys()))}")
 print("Cache cleared — abliterated model will recompute features from scratch\n")
 
-del model_base
-torch.cuda.empty_cache(); gc.collect()
-
-# ── Phase 3: load abliterated model + run inference ───────────────────────────
-
-print("\nLoading abliterated model (fresh V-JEPA2 instances will use patched weights)...")
-model_abl = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
-print("Model loaded.\n")
+# ── Phase 3: run inference ────────────────────────────────────────────────────
 
 gore_mask = np.load(OUT_DIR / "gore_mask.npy")
 porn_mask = np.load(OUT_DIR / "porn_mask.npy")
