@@ -1,3 +1,14 @@
+"""
+tribe_validation.py — Validate abliteration using a LIVE hook instead of weight surgery.
+
+This bypasses the exca caching problem entirely. Instead of modifying weights and hoping
+exca re-extracts, we register a forward hook that fires during actual inference and
+projects out the abliteration direction in the activation stream.
+
+If hook_calls=0 after predict(), exca is caching the full transformer output and
+we need to hook at a deeper level — the script will tell you.
+"""
+
 import os
 import warnings
 import logging
@@ -12,16 +23,15 @@ import pandas as pd
 from pathlib import Path
 from tribev2.demo_utils import TribeModel
 import gc
-import shutil
 import subprocess
 
 VAL_DIR    = Path("./val_data")
 OUT_DIR    = Path("./abliterated")
 CACHE_BASE = Path("./cache")
-CACHE_ABL  = Path("./cache_abliterated")
 STUDY_ROOT = Path("./tribe_study")
+DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+ALPHA = 0.5   # suppression strength — change freely, no re-surgery needed
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -54,35 +64,21 @@ def make_video_only_df(video_path):
         "context":   float("nan"),
     }])
 
-def find_ckpt():
-    """Glob all known HF cache locations for best.ckpt."""
-    candidates = [
-        Path.home() / ".cache" / "huggingface" / "hub",
-        Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub",
-        Path(os.environ.get("HUGGINGFACE_HUB_CACHE", "/nonexistent")),
-    ]
-    for hub in candidates:
-        hits = sorted(hub.glob("**/best.ckpt")) if hub.exists() else []
-        if hits:
-            return hits[0]
-    return None
-
 # ── Load masks ────────────────────────────────────────────────────────────────
 
 gore_mask = np.load(OUT_DIR / "gore_mask.npy")
 porn_mask = np.load(OUT_DIR / "porn_mask.npy")
+print(f"Gore mask: {gore_mask.sum()} vertices")
+print(f"Porn mask: {porn_mask.sum()} vertices")
 
-# ── Phase 1: baseline inference ───────────────────────────────────────────────
-# Load baseline preds from disk (no model needed)
+# ── Load baseline preds from disk (no model needed) ───────────────────────────
 
 val_videos = sorted(VAL_DIR.glob("*.mp4"))
-print(f"Found {len(val_videos)} validation videos\n")
+print(f"\nFound {len(val_videos)} validation videos")
 
-baseline_preds = {}   # stem → np.ndarray (30, n_verts)
-
+baseline_preds = {}
 for vp in val_videos:
-    stem = vp.stem
-    # Re-use saved preds from tribe_study
+    stem  = vp.stem
     saved = None
     for cat_dir in STUDY_ROOT.iterdir():
         if not cat_dir.is_dir():
@@ -91,113 +87,82 @@ for vp in val_videos:
         if candidate.exists():
             saved = candidate
             break
-
     if saved:
         baseline_preds[stem] = np.load(saved)[:30]
-        print(f"  {vp.name}: baseline loaded from {saved.relative_to(STUDY_ROOT)}")
+        print(f"  {vp.name}: baseline from {saved.relative_to(STUDY_ROOT)}")
     else:
-        print(f"  [WARNING] {vp.name}: baseline preds not found on disk. Skipping.")
+        print(f"  [WARN] {vp.name}: no baseline preds found in tribe_study")
 
-# ── Phase 2: Load abliterated model & patch V-JEPA2 ───────────────────────────
+# ── Build abliteration directions ────────────────────────────────────────────
 
-print("\nLoading abliterated model...")
-model_abl = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
-print("Model loaded.\n")
+print("\nLoading abliteration directions...")
+gore_dirs = np.load(OUT_DIR / "gore_directions.npy")
+porn_dirs = np.load(OUT_DIR / "porn_directions.npy")
 
-# Get V-JEPA2 class and inject abliterated weights
-vjepa2_cls = type(model_abl.data.video_feature.image.model.model)
-print(f"  V-JEPA2 class: {vjepa2_cls.__module__}.{vjepa2_cls.__name__}")
+all_dirs = np.concatenate([gore_dirs, porn_dirs], axis=0)
+dirs_t   = torch.tensor(all_dirs, dtype=torch.float32).to(DEVICE)
 
-vjepa2_abl_state = torch.load(OUT_DIR / "vjepa2_abliterated.pt", map_location="cpu")
+# Gram-Schmidt orthogonalization
+ortho = []
+for d in dirs_t:
+    for q in ortho:
+        d = d - (d @ q) * q
+    if d.norm() > 1e-6:
+        ortho.append(d / d.norm())
 
-# Inject abliterated weights into the active instance
-missing, unexpected = model_abl.data.video_feature.image.model.model.load_state_dict(vjepa2_abl_state, strict=False)
-if missing:
-    print(f"  [ACTIVE INSTANCE] {len(missing)} keys missing in abliterated state dict")
-if unexpected:
-    print(f"  [ACTIVE INSTANCE] {len(unexpected)} unexpected keys")
-print("  [ACTIVE INSTANCE] Abliterated weights injected directly into loaded model instance")
+if not ortho:
+    raise ValueError("No valid directions after Gram-Schmidt — check direction files")
 
-# Set up class monkeypatch in case fresh instances are created during predict()
-_original_init = vjepa2_cls.__init__
-_original_from_pretrained = getattr(vjepa2_cls, "from_pretrained", None)
+ortho = torch.stack(ortho)
+print(f"  {len(ortho)} orthogonal directions built (alpha={ALPHA})")
 
-def _abliterated_init(self, *args, **kwargs):
-    _original_init(self, *args, **kwargs)
-    self.load_state_dict(vjepa2_abl_state, strict=False)
-    print(f"  [MONKEYPATCH] Abliterated weights injected into new {vjepa2_cls.__name__} instance via __init__")
+# ── Load model ────────────────────────────────────────────────────────────────
 
-@classmethod
-def _abliterated_from_pretrained(cls, *args, **kwargs):
-    model = _original_from_pretrained(*args, **kwargs)
-    model.load_state_dict(vjepa2_abl_state, strict=False)
-    print(f"  [MONKEYPATCH] Abliterated weights injected into new {vjepa2_cls.__name__} instance via from_pretrained")
-    return model
+print("\nLoading model...")
+model_abl      = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
+vjepa2_module  = model_abl.data.video_feature.image.model.model
+encoder_blocks = vjepa2_module.encoder.layer
+N_LAYERS       = len(encoder_blocks)
+TARGET_IDX     = int(N_LAYERS * 0.75)
+print(f"  encoder.layer count: {N_LAYERS}, target: {TARGET_IDX}")
 
-vjepa2_cls.__init__ = _abliterated_init
-if _original_from_pretrained is not None:
-    vjepa2_cls.from_pretrained = _abliterated_from_pretrained
-print("  Monkeypatch active — any new V-JEPA2 instance will use abliterated weights")
+# Clear any stale hooks
+for m in vjepa2_module.modules():
+    m._forward_hooks.clear()
+    m._forward_pre_hooks.clear()
 
-# ── Clear exca cache for val videos on model_abl ──────────────────────────────
+# ── Register live abliteration hook ──────────────────────────────────────────
+# This fires during every actual forward pass through block TARGET_IDX.
+# Exca caching is irrelevant — if the forward pass runs, the hook fires.
 
-print("\nClearing exca cache for val videos...")
-cache_dict = model_abl.data.video_feature.infra.cache_dict
-item_uid = model_abl.data.video_feature.infra.item_uid
-helper = model_abl.data.video_feature._event_types_helper
+_hook_calls = [0]
 
-# 1. Clear in-memory cache
-all_keys = list(cache_dict.keys())
-print(f"  Total keys currently in cache_dict: {len(all_keys)}")
-for vp in val_videos:
-    df = make_video_only_df(vp)
-    events = helper.extract(df)
-    for event in events:
-        key = item_uid(event)
-        if key in cache_dict:
-            print(f"    -> Deleting in-memory cache key: {key}")
-            del cache_dict[key]
+def abliteration_hook(module, input, output):
+    _hook_calls[0] += 1
+    hidden = output[0] if isinstance(output, tuple) else output
+    for q in ortho:
+        hidden = hidden - ALPHA * (hidden @ q).unsqueeze(-1) * q
+    return (hidden,) + output[1:] if isinstance(output, tuple) else hidden
 
-# 2. Clear disk cache recursively (important to prevent cross-run cache hits)
-print("  Clearing disk cache for validation videos...")
-import json
-val_names = {vp.name for vp in val_videos}
-val_resolved = {str(vp.resolve()) for vp in val_videos}
-deleted_count = 0
+hook_handle = encoder_blocks[TARGET_IDX].register_forward_hook(abliteration_hook)
+print(f"  Live hook registered on encoder.layer[{TARGET_IDX}]")
 
-if CACHE_BASE.exists():
-    for info_file in CACHE_BASE.rglob("*info.jsonl"):
-        try:
-            lines = info_file.read_text().splitlines()
-            match = False
-            for line in lines:
-                try:
-                    data = json.loads(line)
-                    for k, v in data.items():
-                        if isinstance(v, str):
-                            if v in val_resolved or Path(v).name in val_names:
-                                match = True
-                                break
-                except Exception:
-                    pass
-                if match:
-                    break
-            
-            if match:
-                parent_dir = info_file.parent
-                print(f"    -> Deleting disk cache folder: {parent_dir}")
-                shutil.rmtree(parent_dir)
-                deleted_count += 1
-        except Exception as e:
-            print(f"    -> Error processing {info_file}: {e}")
+# Also register hooks on ALL blocks to find out which ones actually fire
+_block_fire_counts = {}
+_block_hooks = []
 
-print(f"  Cleared {deleted_count} cache folders from disk.")
-print("Cache cleared — abliterated model will recompute features from scratch\n")
+def make_probe_hook(idx):
+    def probe(module, input, output):
+        _block_fire_counts[idx] = _block_fire_counts.get(idx, 0) + 1
+    return probe
 
-# ── Phase 3: run inference ────────────────────────────────────────────────────
+for i, block in enumerate(encoder_blocks):
+    h = block.register_forward_hook(make_probe_hook(i))
+    _block_hooks.append(h)
 
-gore_mask = np.load(OUT_DIR / "gore_mask.npy")
-porn_mask = np.load(OUT_DIR / "porn_mask.npy")
+print("  Probe hooks registered on all encoder blocks")
+
+# ── Inference loop ────────────────────────────────────────────────────────────
 
 results = []
 
@@ -205,20 +170,33 @@ try:
     for vp in val_videos:
         stem = vp.stem
         if stem not in baseline_preds:
-            print(f"  [SKIP] no baseline for {vp.name}")
+            print(f"\n[SKIP] no baseline for {vp.name}")
             continue
 
-        print(f"{'='*50}")
+        print(f"\n{'='*55}")
         print(f"Video: {vp.name}")
 
-        preds_base = baseline_preds[stem]
+        # Reset counters
+        _hook_calls[0] = 0
+        _block_fire_counts.clear()
 
-        df = make_video_only_df(vp)
+        preds_base = baseline_preds[stem]
+        df         = make_video_only_df(vp)
         print(f"  Duration: {df['duration'].values[0]:.3f}s")
         print("  Running abliterated inference...")
+
         preds_abl, _ = model_abl.predict(events=df)
         preds_abl = preds_abl[:30]
-        torch.cuda.empty_cache(); gc.collect()
+
+        # Diagnostic: did the hook actually fire?
+        print(f"\n  [DIAG] Abliteration hook fired: {_hook_calls[0]} times")
+        fired_blocks = sorted(_block_fire_counts.keys())
+        if fired_blocks:
+            print(f"  [DIAG] Blocks that fired: {fired_blocks[0]}–{fired_blocks[-1]} "
+                  f"({len(fired_blocks)} total)")
+        else:
+            print(f"  [DIAG] WARNING: NO encoder blocks fired — "
+                  f"exca is serving fully-cached output, hooks cannot intercept")
 
         print()
         for mask, mname in [(gore_mask, "gore_mask"), (porn_mask, "porn_mask")]:
@@ -236,21 +214,45 @@ try:
         global_pct  = 100 * (abl_global - base_global) / (abs(base_global) + 1e-9)
         print(f"  {'whole_brain':12s}  base={base_global:.4f}  abl={abl_global:.4f}  "
               f"Δ={abl_global-base_global:+.4f} ({global_pct:+.1f}%)")
-        print()
+
+        torch.cuda.empty_cache()
+        gc.collect()
 
         results.append({
             "video":      vp.name,
             "preds_base": preds_base,
             "preds_abl":  preds_abl,
+            "hook_calls": _hook_calls[0],
         })
 
 finally:
-    # Always restore the original __init__ and from_pretrained so the class is clean for any
-    # subsequent code or imports.
-    vjepa2_cls.__init__ = _original_init
-    if _original_from_pretrained is not None:
-        vjepa2_cls.from_pretrained = _original_from_pretrained
-    print("V-JEPA2 class monkeypatches restored.")
+    hook_handle.remove()
+    for h in _block_hooks:
+        h.remove()
+    print("\nAll hooks removed.")
+
+# ── Summary ───────────────────────────────────────────────────────────────────
+
+print("\n" + "="*55)
+print("SUMMARY")
+print("="*55)
+for r in results:
+    hook_status = f"hook fired {r['hook_calls']}x" if r['hook_calls'] > 0 else "HOOK DID NOT FIRE"
+    print(f"  {r['video']:20s}  {hook_status}")
+
+all_fired = all(r['hook_calls'] > 0 for r in results)
+if not all_fired:
+    print("\n  *** DIAGNOSIS: exca is caching full V-JEPA2 output. ***")
+    print("  The hook at encoder.layer[TARGET_IDX] never fires because")
+    print("  the extractor loads cached activations from disk and skips")
+    print("  the transformer forward pass entirely.")
+    print()
+    print("  NEXT STEP: hook at the exca output level instead.")
+    print("  Run this to find the right interception point:")
+    print()
+    print("    python find_cache_intercept.py")
+else:
+    print("\n  Hook fired correctly. Abliteration is active.")
 
 # ── Save ──────────────────────────────────────────────────────────────────────
 
