@@ -104,11 +104,24 @@ def iter_clips(video_path):
 
 # ── Collect activations + vertex targets ──────────────────────────────────────
 
-def collect_for_category(category, filenames, mask):
-    X_all, y_all = [], []
+def collect_for_category(category, filenames, mask, out_dir):
+    acts_dir = out_dir / f"acts_{category}"
+    acts_dir.mkdir(exist_ok=True)
+    
+    X_paths, y_paths = [], []
 
     for fname in filenames:
-        stem       = Path(fname).stem
+        stem = Path(fname).stem
+        act_path = acts_dir / f"{stem}_acts.npy"
+        y_path   = acts_dir / f"{stem}_y.npy"
+        
+        # Skip if already collected
+        if act_path.exists() and y_path.exists():
+            print(f"  [CACHED] {fname}")
+            X_paths.append(act_path)
+            y_paths.append(y_path)
+            continue
+
         preds_path = STUDY_ROOT / category / stem / "preds.npy"
         video_path = (DATA_DIR / fname).resolve()
 
@@ -117,20 +130,19 @@ def collect_for_category(category, filenames, mask):
             continue
 
         preds = np.load(preds_path)[:30]
-        y_tr  = preds[:, mask].mean(axis=1)            # (30,)
+        y_tr  = preds[:, mask].mean(axis=1)
 
         try:
             clip_acts, clip_ys = [], []
             clip_idx = 0
+            vjepa2_module.eval()
             for clip in iter_clips(video_path):
-                inp = clip.unsqueeze(0).to(DEVICE)     # (1,T,C,H,W)
+                inp = clip.unsqueeze(0).to(DEVICE)
                 collected_acts.clear()
-                vjepa2_module.eval()
                 with torch.no_grad():
                     vjepa2_module(pixel_values_videos=inp)
                 if collected_acts:
                     clip_acts.append(collected_acts[-1].squeeze(0).numpy())
-                    # map clip index to TR bucket
                     t_start = int(clip_idx * CLIP_DURATION)
                     t_end   = min(t_start + CLIP_DURATION, 30)
                     clip_ys.append(float(y_tr[t_start:t_end].mean()))
@@ -143,24 +155,30 @@ def collect_for_category(category, filenames, mask):
             continue
 
         if clip_acts:
-            X_all.append(np.stack(clip_acts))
-            y_all.append(np.array(clip_ys))
-            print(f"  {fname}: {len(clip_acts)} clips, "
-                  f"y∈[{np.array(clip_ys).min():.3f}, {np.array(clip_ys).max():.3f}]")
+            np.save(act_path, np.stack(clip_acts))
+            np.save(y_path,   np.array(clip_ys))
+            X_paths.append(act_path)
+            y_paths.append(y_path)
+            print(f"  {fname}: {len(clip_acts)} clips saved to disk")
 
+        del preds, y_tr
+        torch.cuda.empty_cache()
         time.sleep(0.1)
         gc.collect()
 
-    if not X_all:
+    if not X_paths:
         return None, None
-    return np.concatenate(X_all), np.concatenate(y_all)
-
+    
+    # Load all at once only for PCA — still fits since it's just numpy
+    X_all = np.concatenate([np.load(p) for p in X_paths])
+    y_all = np.concatenate([np.load(p) for p in y_paths])
+    return X_all, y_all
 
 print("\nCollecting gore activations (strong signal)...")
-X_gore, y_gore = collect_for_category("gore", CATEGORIES["gore"], gore_mask)
+X_gore, y_gore = collect_for_category("gore", CATEGORIES["gore"], gore_mask, OUT_DIR)
 
 print("\nCollecting porn activations (weak signal — body/skin proxy)...")
-X_porn, y_porn = collect_for_category("porn", CATEGORIES["porn"], porn_mask)
+X_porn, y_porn = collect_for_category("porn", CATEGORIES["porn"], porn_mask, OUT_DIR)
 
 hook_handle.remove()
 torch.cuda.empty_cache()
