@@ -1,10 +1,9 @@
 """
-find_cache_intercept.py — Find where exca caches V-JEPA2 output and identify
-the correct hook point for live abliteration.
+find_cache_intercept.py — Find where exca caches V-JEPA2 output.
 
-Run this if tribe_validation.py reports hook_calls=0.
-It traces all module forward calls during a single predict() to find which
-modules actually execute vs which are bypassed by cache.
+741 hooks on vjepa2_module fired 0 times → exca returns cached features
+before V-JEPA2 ever runs. This script walks the full model object tree
+(not just nn.Module) to find the cache read path and the correct hook point.
 """
 
 import os, warnings, logging
@@ -45,147 +44,207 @@ def make_video_only_df(video_path):
         "context": float("nan"),
     }])
 
+# ── Load model ────────────────────────────────────────────────────────────────
+
 print("Loading model...")
 model         = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
 vjepa2_module = model.data.video_feature.image.model.model
 
-# ── Hook every nn.Module in vjepa2_module ────────────────────────────────────
+# ── Walk full object tree to find all nn.Modules ──────────────────────────────
 
-fired = {}   # module_name → call_count
+print("\n=== ALL nn.Module instances reachable from model.data ===")
+
+def walk_for_modules(obj, path="model", visited=None, depth=0, max_depth=8):
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited or depth > max_depth:
+        return
+    visited.add(obj_id)
+
+    if isinstance(obj, torch.nn.Module):
+        params = sum(p.numel() for p in obj.parameters())
+        print(f"  {'  '*depth}[nn.Module] {path}  ({type(obj).__name__})  params={params:,}")
+
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if not isinstance(v, (int, float, str, bool, bytes, type(None))):
+                walk_for_modules(v, f"{path}[{k!r}]", visited, depth+1, max_depth)
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            if not isinstance(v, (int, float, str, bool, bytes, type(None))):
+                walk_for_modules(v, f"{path}[{i}]", visited, depth+1, max_depth)
+    else:
+        try:
+            attrs = vars(obj) if not isinstance(obj, torch.nn.Module) else {}
+        except TypeError:
+            attrs = {}
+        for k, v in attrs.items():
+            if k.startswith("_") and k not in ("_modules", "_parameters"):
+                continue
+            if callable(v) and not isinstance(v, torch.nn.Module):
+                continue
+            if not isinstance(v, (int, float, str, bool, bytes, type(None))):
+                walk_for_modules(v, f"{path}.{k}", visited, depth+1, max_depth)
+
+walk_for_modules(model.data, path="model.data", max_depth=6)
+
+# ── Inspect the infra / cache objects directly ────────────────────────────────
+
+print("\n=== EXCA INFRA INSPECTION ===")
+infra = model.data.video_feature.infra
+print(f"infra type: {type(infra)}")
+print(f"infra attrs: {[a for a in dir(infra) if not a.startswith('__')]}")
+
+cache_dict = None
+try:
+    cache_dict = infra.cache_dict
+    print(f"\ncache_dict type: {type(cache_dict)}")
+    keys = list(cache_dict.keys())
+    print(f"cache_dict key count: {len(keys)}")
+    if keys:
+        k0 = keys[0]
+        v0 = cache_dict[k0]
+        print(f"\nSample key: {k0!r}")
+        print(f"Sample value type: {type(v0)}")
+        if isinstance(v0, np.ndarray):
+            print(f"  shape={v0.shape}  dtype={v0.dtype}")
+        elif isinstance(v0, torch.Tensor):
+            print(f"  shape={v0.shape}  dtype={v0.dtype}")
+        elif isinstance(v0, dict):
+            for kk, vv in v0.items():
+                if hasattr(vv, 'shape'):
+                    print(f"  [{kk}]: shape={vv.shape}  dtype={vv.dtype}")
+                else:
+                    print(f"  [{kk}]: {type(vv)}")
+        else:
+            print(f"  value: {str(v0)[:200]}")
+except Exception as e:
+    print(f"cache_dict inspection failed: {e}")
+
+# ── Check .data files ────────────────────────────────────────────────────────
+
+print("\n=== EXCA DISK CACHE FILES ===")
+data_files = sorted(CACHE_BASE.rglob("*.data"))
+print(f"Found {len(data_files)} .data files")
+for f in data_files[:10]:
+    size_mb = f.stat().st_size / 1024**2
+    print(f"  {f.relative_to(CACHE_BASE)}  ({size_mb:.1f} MB)")
+
+# ── Hook all nn.Modules NOT inside vjepa2_module ─────────────────────────────
+
+print("\n=== HOOKING NON-VJEPA2 nn.Modules DURING predict() ===")
+
+vjepa2_ids = {id(m) for m in vjepa2_module.modules()}
+fired_outside = {}
 hooks = []
+seen_ids = set()
 
 def make_hook(name):
     def h(module, inp, out):
-        fired[name] = fired.get(name, 0) + 1
+        fired_outside[name] = fired_outside.get(name, 0) + 1
+        if fired_outside[name] == 1:
+            in_shapes = []
+            for x in (inp if isinstance(inp, (list, tuple)) else [inp]):
+                in_shapes.append(x.shape if isinstance(x, torch.Tensor) else type(x).__name__)
+            out_shapes = []
+            for x in (out if isinstance(out, (list, tuple)) else [out]):
+                out_shapes.append(x.shape if isinstance(x, torch.Tensor) else type(x).__name__)
+            print(f"    FIRED: {name}  in={in_shapes}  out={out_shapes}")
     return h
 
-for name, mod in vjepa2_module.named_modules():
-    h = mod.register_forward_hook(make_hook(name or "ROOT"))
-    hooks.append(h)
+def enqueue_children(obj, path):
+    obj_id = id(obj)
+    if obj_id in seen_ids:
+        return
+    seen_ids.add(obj_id)
+    if isinstance(obj, torch.nn.Module):
+        if id(obj) not in vjepa2_ids:
+            h = obj.register_forward_hook(make_hook(path))
+            hooks.append(h)
+        for name, child in obj.named_children():
+            enqueue_children(child, f"{path}.{name}")
+    try:
+        attrs = vars(obj) if not isinstance(obj, torch.nn.Module) else {}
+        for k, v in attrs.items():
+            if k.startswith("_"):
+                continue
+            if isinstance(v, torch.nn.Module):
+                enqueue_children(v, f"{path}.{k}")
+    except Exception:
+        pass
 
-print(f"Registered hooks on {len(hooks)} modules inside vjepa2_module")
-
-# ── Also hook the top-level video feature extractor ──────────────────────────
-# to catch if exca intercepts before vjepa2_module is ever called
-
-video_feature = model.data.video_feature
-image_model   = video_feature.image
-
-top_fired = {}
-top_hooks = []
-
-def make_top_hook(name):
-    def h(module, inp, out):
-        top_fired[name] = top_fired.get(name, 0) + 1
-    return h
-
-for name, mod in image_model.named_modules():
-    h = mod.register_forward_hook(make_top_hook(f"image.{name}" or "image.ROOT"))
-    top_hooks.append(h)
-
-print(f"Registered {len(top_hooks)} hooks on image_model wrapper")
+enqueue_children(model, "model")
+print(f"Registered hooks on {len(hooks)} non-vjepa2 nn.Modules")
 
 # ── Run one prediction ────────────────────────────────────────────────────────
 
 val_videos = sorted(VAL_DIR.glob("*.mp4"))
 if not val_videos:
-    raise FileNotFoundError("No .mp4 files in val_data/")
+    raise FileNotFoundError("No .mp4 in val_data/")
 
 vp = val_videos[0]
 print(f"\nRunning predict() on {vp.name}...")
-df = make_video_only_df(vp)
+df    = make_video_only_df(vp)
 preds, _ = model.predict(events=df)
-print(f"predict() returned shape: {preds.shape}")
+print(f"\npredict() done, output shape: {preds.shape}")
 
-# ── Remove hooks ─────────────────────────────────────────────────────────────
-
-for h in hooks + top_hooks:
+for h in hooks:
     h.remove()
 
 # ── Report ────────────────────────────────────────────────────────────────────
 
-print("\n" + "="*60)
-print("MODULES THAT FIRED INSIDE vjepa2_module:")
-print("="*60)
-if not fired:
-    print("  NONE — vjepa2_module forward was never called!")
-    print("  exca is returning fully-cached features before V-JEPA2 runs.")
-    print("  You need to intercept at the image_model or video_feature level.")
-else:
-    # Show only modules that fired, sorted by call count
-    for name, count in sorted(fired.items(), key=lambda x: -x[1])[:30]:
-        print(f"  {count:4d}x  {name}")
-
-print("\n" + "="*60)
-print("MODULES THAT FIRED IN image_model WRAPPER:")
-print("="*60)
-if not top_fired:
+print("\n=== NON-VJEPA2 MODULES THAT FIRED ===")
+if not fired_outside:
     print("  NONE")
 else:
-    for name, count in sorted(top_fired.items(), key=lambda x: -x[1])[:30]:
+    for name, count in sorted(fired_outside.items(), key=lambda x: -x[1]):
         print(f"  {count:4d}x  {name}")
 
-# ── Check what exca actually caches ──────────────────────────────────────────
+# ── Inspect _HuggingFace wrapper ──────────────────────────────────────────────
 
-print("\n" + "="*60)
-print("EXCA CACHE INSPECTION:")
-print("="*60)
-
+print("\n=== _HuggingFace WRAPPER ===")
+hf_wrapper = model.data.video_feature.image.model
+print(f"Type: {type(hf_wrapper)}")
+print(f"MRO: {[c.__name__ for c in type(hf_wrapper).__mro__[:6]]}")
+print(f"Is nn.Module: {isinstance(hf_wrapper, torch.nn.Module)}")
 try:
-    cache_dict = model.data.video_feature.infra.cache_dict
-    keys       = list(cache_dict.keys())
-    print(f"  cache_dict keys: {len(keys)}")
-    if keys:
-        k = keys[0]
-        v = cache_dict[k]
-        print(f"  Sample key:   {k}")
-        print(f"  Sample value type: {type(v)}")
-        if hasattr(v, 'shape'):
-            print(f"  Sample value shape: {v.shape}")
-        elif isinstance(v, dict):
-            for kk, vv in v.items():
-                shape = vv.shape if hasattr(vv, 'shape') else type(vv)
-                print(f"    {kk}: {shape}")
+    print(f"attrs: {[a for a in dir(hf_wrapper) if not a.startswith('_')][:40]}")
 except Exception as e:
-    print(f"  Could not inspect cache_dict: {e}")
+    print(f"  dir() failed: {e}")
 
-# ── Print the call stack for image_model ─────────────────────────────────────
+# ── item_uid / cache key structure ───────────────────────────────────────────
 
-print("\n" + "="*60)
-print("RECOMMENDATION:")
-print("="*60)
-if not fired:
-    print("""
-  exca is caching the FULL V-JEPA2 output. The transformer never runs.
+print("\n=== CACHE KEY STRUCTURE ===")
+try:
+    item_uid = infra.item_uid
+    helper   = model.data.video_feature._event_types_helper
+    df_test  = make_video_only_df(vp)
+    events   = helper.extract(df_test)
+    for ev in events:
+        key = item_uid(ev)
+        print(f"  event type: {type(ev).__name__}")
+        print(f"  cache key:  {key!r}")
+        in_cache = (cache_dict is not None) and (key in cache_dict)
+        print(f"  in cache:   {in_cache}")
+        break
+except Exception as e:
+    print(f"  item_uid inspection failed: {e}")
 
-  To abliterate, you need to hook at the point where cached features
-  are consumed downstream — i.e., in the regression/encoding head that
-  maps V-JEPA2 features to cortical predictions.
+# ── Print the __call__ / extract source of infra ─────────────────────────────
 
-  This means the abliteration direction needs to be projected out of
-  the CACHED FEATURE VECTOR, not the internal attention activations.
+print("\n=== INFRA __call__ SOURCE ===")
+try:
+    import inspect
+    src = inspect.getsource(type(infra).__call__)
+    print(src[:3000])
+except Exception as e:
+    print(f"  Could not get source: {e}")
+    # Try the extract method if __call__ fails
+    try:
+        src = inspect.getsource(type(infra).extract)
+        print(src[:3000])
+    except Exception as e2:
+        print(f"  Could not get extract source either: {e2}")
 
-  Next steps:
-  1. Check what shape the cached values are (printed above)
-  2. Hook the module that READS from cache and processes features
-  3. Project out the abliteration direction there
-
-  Look for something like:
-    model.data.video_feature.image.model  (the _HuggingFace wrapper)
-  or
-    model.data  (the top-level data module)
-
-  The abliteration direction was computed from encoder.layer[TARGET_IDX]
-  hidden states — those are 1408-dim. If the cached value shape matches
-  1408 or is derived from it, you can hook at the cache read point.
-""")
-else:
-    print(f"""
-  V-JEPA2 DID run ({len(fired)} modules fired).
-  The hook at encoder.layer[TARGET_IDX] should work.
-  
-  If tribe_validation.py still shows no effect, check:
-  1. That TARGET_IDX matches the block you hooked during collection
-  2. That the direction signs are correct (run with alpha=-0.5 to test reversal)
-  3. That the ortho vectors are on the correct device (DEVICE={DEVICE})
-""")
+print("\nDone.")
