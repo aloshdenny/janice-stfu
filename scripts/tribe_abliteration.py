@@ -256,7 +256,8 @@ def apply_weight_surgery():
         W = mod.weight.data
         print(f"  Surgery on block[{TARGET_IDX}].{layer_name}  {W.shape}")
         for q in ortho:
-            W -= (W @ q).unsqueeze(-1) * q
+            alpha = 0.5  # suppression strength
+            W -= alpha * (W @ q).unsqueeze(-1) * q
         mod.weight.data = W
 
     torch.save(vjepa2_module.state_dict(), OUT_DIR / "vjepa2_abliterated.pt")
