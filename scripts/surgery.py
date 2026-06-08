@@ -139,6 +139,12 @@ gc.collect()
 
 gore_mask = np.load(GORE_MASK_FILE)
 porn_mask = np.load(PORN_MASK_FILE)
+
+# Save masks to OUT_DIR for validation.py
+np.save(OUT_DIR / "gore_mask.npy", gore_mask)
+np.save(OUT_DIR / "porn_mask.npy", porn_mask)
+print(f"Masks saved → {OUT_DIR}")
+
 print(f"\nGore mask: {gore_mask.sum()} vertices")
 print(f"Porn mask: {porn_mask.sum()} vertices")
 
