@@ -4,9 +4,10 @@ collect_acts.py — Activation collection with aggressive memory management.
 Strategy:
 - Single persistent process (no subprocess overhead)
 - Model loaded ONCE, stays loaded for all videos
-- Hook output written directly to preallocated mmap arrays
-- Explicit CUDA graph clearing between videos
-- ulimit-aware: checks available memory before each video
+- VideoReader: streams only CLIP_FRAMES*4 raw frames per clip window —
+  the full video is never decoded into RAM at once
+- Hook uses a single-slot buffer, no accumulation possible
+- Hidden dim derived at runtime — no hardcoded 1408 assumption
 
 Usage:
     python collect_acts.py [--category gore|porn|both]
@@ -16,13 +17,11 @@ import os, warnings, logging, gc, argparse, time
 warnings.filterwarnings("ignore")
 logging.disable(logging.WARNING)
 os.environ["PYTHONWARNINGS"] = "ignore"
-# Limit torch threads to reduce memory overhead
 os.environ["OMP_NUM_THREADS"] = "2"
 os.environ["MKL_NUM_THREADS"] = "2"
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from pathlib import Path
 import torchvision.io as tvio
 from torchvision import transforms
@@ -42,7 +41,7 @@ GORE_MASK_FILE = MASK_DIR / "gore_strict_bicontrast_strict.npy"
 PORN_MASK_FILE = MASK_DIR / "porn_no_food_strict.npy"
 
 CLIP_FRAMES   = 16
-CLIP_DURATION = 4
+CLIP_DURATION = 4      # seconds per clip
 IMG_SIZE      = 256
 
 CATEGORIES = {
@@ -94,13 +93,13 @@ for m in vjepa2_module.modules():
 
 report_mem("after model load")
 
-# ── Hook — uses a single slot, never accumulates ──────────────────────────────
+# ── Hook — single-slot buffer, no accumulation ────────────────────────────────
 
 _hook_buffer = [None]  # single slot — replaced on every forward pass
 
 def hook_fn(module, input, output):
     hidden = output[0] if isinstance(output, tuple) else output
-    # mean over token dim immediately, move to CPU, detach
+    # Mean over token dim immediately; move to CPU, detach from graph
     _hook_buffer[0] = hidden.mean(dim=1).detach().cpu().float()
 
 hook_handle = encoder_blocks[TARGET_IDX].register_forward_hook(hook_fn)
@@ -112,14 +111,14 @@ normalize_fn = transforms.Normalize(
 
 vjepa2_module.eval()
 
-# ── Per-video collection ──────────────────────────────────────────────────────
+# ── Per-video collection (streaming — never loads full video into RAM) ────────
 
 def process_video(category, fname, mask):
-    stem       = Path(fname).stem
-    acts_dir   = OUT_DIR / f"acts_{category}"
+    stem     = Path(fname).stem
+    acts_dir = OUT_DIR / f"acts_{category}"
     acts_dir.mkdir(exist_ok=True)
-    act_path   = acts_dir / f"{stem}_acts.npy"
-    y_path     = acts_dir / f"{stem}_y.npy"
+    act_path = acts_dir / f"{stem}_acts.npy"
+    y_path   = acts_dir / f"{stem}_y.npy"
 
     if act_path.exists() and y_path.exists():
         print(f"  [CACHED] {fname}")
@@ -135,84 +134,110 @@ def process_video(category, fname, mask):
         print(f"  [SKIP] no video: {fname}")
         return False
 
-    # Check RAM before reading video
     ram = ram_available_mb()
-    if ram < 4000:
-        print(f"  [WAIT] low RAM ({ram}MB), sleeping 5s...")
-        time.sleep(5)
+    if ram < 2000:
+        print(f"  [WAIT] low RAM ({ram}MB), sleeping 10s...")
+        time.sleep(10)
         gc.collect()
         torch.cuda.empty_cache()
 
     preds = np.load(preds_path)[:30]
     y_tr  = preds[:, mask].mean(axis=1)   # (30,)
 
-    # Read video — this is the big RAM spike
+    # Open VideoReader — only a handful of frames in memory at once
     try:
-        vframes, _, info = tvio.read_video(str(video_path), pts_unit="sec")
+        reader = tvio.VideoReader(str(video_path), "video")
+        meta   = reader.get_metadata()
+        fps    = meta["video"]["fps"][0]      if meta["video"]["fps"]      else 30.0
+        dur    = meta["video"]["duration"][0] if meta["video"]["duration"] else 30.0
     except Exception as e:
-        print(f"  [ERROR] read_video {fname}: {e}")
+        print(f"  [ERROR] open {fname}: {e}")
         del preds, y_tr
         return False
 
+    n_clips          = max(1, int((dur * fps) // (CLIP_DURATION * fps)))
+    clip_acts_list: list[np.ndarray] = []
+    clip_ys_list:   list[float]      = []
+
     try:
-        vframes = vframes.float() / 255.0
-        vframes = vframes.permute(0, 3, 1, 2)   # (T, C, H, W)
-        fps     = info.get("video_fps", 30.0)
-        total_f = vframes.shape[0]
-        spf     = CLIP_DURATION * fps
-        n_clips = max(1, int(total_f // spf))
-
-        clip_acts = np.empty((n_clips, 1408), dtype=np.float32)  # preallocate
-        clip_ys   = np.empty((n_clips,),      dtype=np.float32)
-        valid     = 0
-
         for c in range(n_clips):
-            start = int(c * spf)
-            end   = min(start + int(spf), total_f)
-            chunk = vframes[start:end]
-            idx   = torch.linspace(0, len(chunk) - 1, CLIP_FRAMES).long()
-            clip  = chunk[idx]
-            clip  = torch.stack([
-                normalize_fn(resize(clip[i], [IMG_SIZE, IMG_SIZE]))
-                for i in range(len(clip))
-            ])  # (T, C, H, W)
+            t_seek  = float(c * CLIP_DURATION)
+            t_end_s = t_seek + CLIP_DURATION
 
-            inp = clip.unsqueeze(0).to(DEVICE)  # (1, T, C, H, W)
+            # Stream only the frames that fall in this clip window
+            frames: list[torch.Tensor] = []
+            try:
+                reader.seek(t_seek)
+                for frame_data in reader:
+                    if frame_data["pts"] >= t_end_s:
+                        break
+                    frames.append(frame_data["data"])    # uint8 (C, H, W)
+                    if len(frames) >= CLIP_FRAMES * 4:   # safety cap
+                        break
+            except Exception as e:
+                print(f"  [WARN] clip {c}/{n_clips} of {fname}: {e}")
+                del frames
+                continue
+
+            if len(frames) < 2:
+                del frames
+                continue
+
+            # Subsample to exactly CLIP_FRAMES, normalise, resize — CPU only
+            frames_t = torch.stack(frames).float() / 255.0  # (T, C, H, W)
+            del frames
+            idx  = torch.linspace(0, len(frames_t) - 1, CLIP_FRAMES).long()
+            clip = frames_t[idx]                              # (CLIP_FRAMES, C, H, W)
+            del frames_t
+            clip = torch.stack([
+                normalize_fn(resize(clip[i], [IMG_SIZE, IMG_SIZE]))
+                for i in range(CLIP_FRAMES)
+            ])                                                # (CLIP_FRAMES, C, H, W)
+
+            inp = clip.unsqueeze(0).to(DEVICE)                # (1, T, C, H, W)
+            del clip
             _hook_buffer[0] = None
 
             with torch.no_grad():
                 vjepa2_module(pixel_values_videos=inp)
+            del inp
 
             if _hook_buffer[0] is not None:
-                clip_acts[valid] = _hook_buffer[0].squeeze(0).numpy()
-                t_start = int(c * CLIP_DURATION)
-                t_end   = min(t_start + CLIP_DURATION, 30)
-                clip_ys[valid] = float(y_tr[t_start:t_end].mean())
-                valid += 1
-
-            # Immediately free clip tensors
-            del inp, clip, chunk
+                # hidden_dim derived at runtime — no hardcode needed
+                clip_acts_list.append(_hook_buffer[0].squeeze(0).numpy().copy())
+                t_start_tr = int(c * CLIP_DURATION)
+                t_end_tr   = min(t_start_tr + CLIP_DURATION, 30)
+                clip_ys_list.append(float(y_tr[t_start_tr:t_end_tr].mean()))
             _hook_buffer[0] = None
-            # Don't call empty_cache every clip — it's slow; do it per video
-
-        if valid > 0:
-            np.save(act_path, clip_acts[:valid])
-            np.save(y_path,   clip_ys[:valid])
-            print(f"  {fname}: {valid} clips  "
-                  f"y=[{clip_ys[:valid].min():.3f}, {clip_ys[:valid].max():.3f}]")
-        else:
-            print(f"  [WARN] {fname}: no valid clips")
-
-        return valid > 0
 
     except Exception as e:
         print(f"  [ERROR] {fname}: {e}")
         return False
 
     finally:
-        del vframes, preds, y_tr
+        try:
+            del reader
+        except Exception:
+            pass
+        del preds, y_tr
         torch.cuda.empty_cache()
         gc.collect()
+
+    valid = len(clip_acts_list)
+    if valid > 0:
+        arr_acts = np.stack(clip_acts_list)                   # (valid, hidden_dim)
+        arr_ys   = np.array(clip_ys_list, dtype=np.float32)
+        np.save(act_path, arr_acts)
+        np.save(y_path,   arr_ys)
+        print(f"  {fname}: {valid} clips  "
+              f"y=[{arr_ys.min():.3f}, {arr_ys.max():.3f}]  "
+              f"act_dim={arr_acts.shape[1]}")
+        del arr_acts, arr_ys
+    else:
+        print(f"  [WARN] {fname}: no valid clips")
+
+    del clip_acts_list, clip_ys_list
+    return valid > 0
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
@@ -233,7 +258,7 @@ def run_category(category):
         else:
             failed += 1
 
-        # Periodic cache flush
+        # Periodic CUDA flush
         if i % 8 == 7:
             torch.cuda.empty_cache()
             gc.collect()
