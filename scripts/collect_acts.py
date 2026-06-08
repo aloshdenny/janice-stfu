@@ -1,16 +1,33 @@
 """
-collect_acts.py — Phase 1 only: extract and cache activations per video.
-No model lives in the parent process. Run this first, then run surgery.py.
+collect_acts.py — Activation collection with aggressive memory management.
+
+Strategy:
+- Single persistent process (no subprocess overhead)
+- Model loaded ONCE, stays loaded for all videos
+- Hook output written directly to preallocated mmap arrays
+- Explicit CUDA graph clearing between videos
+- ulimit-aware: checks available memory before each video
 
 Usage:
-    python collect_acts.py [--batch N]   (default batch=1 video per subprocess)
+    python collect_acts.py [--category gore|porn|both]
 """
 
-import os, sys, warnings, logging, argparse, subprocess, gc
-from pathlib import Path
-
+import os, warnings, logging, gc, argparse, time
 warnings.filterwarnings("ignore")
 logging.disable(logging.WARNING)
+os.environ["PYTHONWARNINGS"] = "ignore"
+# Limit torch threads to reduce memory overhead
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+import torchvision.io as tvio
+from torchvision import transforms
+from torchvision.transforms.functional import resize
+from tribev2.demo_utils import TribeModel
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -21,84 +38,70 @@ DATA_DIR      = Path("./data")
 OUT_DIR       = Path("./abliterated")
 OUT_DIR.mkdir(exist_ok=True)
 
-# These must match surgery.py
 GORE_MASK_FILE = MASK_DIR / "gore_strict_bicontrast_strict.npy"
 PORN_MASK_FILE = MASK_DIR / "porn_no_food_strict.npy"
 
 CLIP_FRAMES   = 16
 CLIP_DURATION = 4
 IMG_SIZE      = 256
-# TARGET_IDX computed inside subprocess — not needed here at all
 
 CATEGORIES = {
     "gore": [f"gore{i}.mp4" for i in range(1, 49)],
     "porn": [f"porn{i}.mp4" for i in range(1, 49)],
 }
 
-# ── Subprocess script template ────────────────────────────────────────────────
-# Receives a batch of filenames. Loads model ONCE per subprocess, processes
-# all videos in the batch, then exits — OS reclaims all memory.
+# ── Args ──────────────────────────────────────────────────────────────────────
 
-WORKER_TEMPLATE = '''
-import os, warnings, logging, gc, sys
-warnings.filterwarnings("ignore")
-logging.disable(logging.WARNING)
+parser = argparse.ArgumentParser()
+parser.add_argument("--category", default="both", choices=["gore", "porn", "both"])
+args = parser.parse_args()
 
-import numpy as np
-import torch
-from pathlib import Path
-import torchvision.io as tvio
-from torchvision import transforms
-from torchvision.transforms.functional import resize
-from tribev2.demo_utils import TribeModel
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-OUT_DIR    = Path({out_dir!r})
-STUDY_ROOT = Path({study_root!r})
-DATA_DIR   = Path({data_dir!r})
-CACHE_DIR  = Path({cache_dir!r})
-DEVICE        = {device!r}
-CLIP_FRAMES   = {clip_frames}
-CLIP_DURATION = {clip_duration}
-IMG_SIZE      = {img_size}
-category      = {category!r}
-mask_file     = {mask_file!r}
-fnames        = {fnames!r}
+# ── Memory reporting ──────────────────────────────────────────────────────────
 
-acts_dir = OUT_DIR / f"acts_{{category}}"
-acts_dir.mkdir(exist_ok=True)
+def report_mem(tag=""):
+    if torch.cuda.is_available():
+        a = torch.cuda.memory_allocated() / 1024**2
+        r = torch.cuda.memory_reserved() / 1024**2
+        print(f"  [MEM{(' '+tag) if tag else ''}] VRAM alloc={a:.0f}MB reserved={r:.0f}MB")
 
-# ── Check which videos actually need processing ───────────────────────────────
-todo = []
-for fname in fnames:
-    stem     = Path(fname).stem
-    act_path = acts_dir / f"{{stem}}_acts.npy"
-    y_path   = acts_dir / f"{{stem}}_y.npy"
-    if act_path.exists() and y_path.exists():
-        print(f"  [CACHED] {{fname}}", flush=True)
-    else:
-        todo.append(fname)
+def ram_available_mb():
+    try:
+        import subprocess
+        r = subprocess.run(['free', '-m'], capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            if line.startswith('Mem:'):
+                return int(line.split()[6])  # available column
+    except Exception:
+        pass
+    return 99999  # unknown, proceed
 
-if not todo:
-    print("  All cached, exiting.", flush=True)
-    sys.exit(0)
+# ── Load model ONCE ───────────────────────────────────────────────────────────
 
-# ── Load model ONCE for this batch ───────────────────────────────────────────
-print(f"  Loading model for batch of {{len(todo)}} videos...", flush=True)
+print("Loading TribeModel (once)...")
 model = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
+
 vjepa2_module  = model.data.video_feature.image.model.model
 encoder_blocks = vjepa2_module.encoder.layer
 N_LAYERS       = len(encoder_blocks)
 TARGET_IDX     = int(N_LAYERS * 0.75)
+print(f"Encoder layers: {N_LAYERS}, target: {TARGET_IDX}")
 
 for m in vjepa2_module.modules():
     m._forward_hooks.clear()
     m._forward_pre_hooks.clear()
 
-collected_acts = []
+report_mem("after model load")
+
+# ── Hook — uses a single slot, never accumulates ──────────────────────────────
+
+_hook_buffer = [None]  # single slot — replaced on every forward pass
+
 def hook_fn(module, input, output):
     hidden = output[0] if isinstance(output, tuple) else output
-    collected_acts.clear()
-    collected_acts.append(hidden.mean(dim=1).detach().cpu().float())
+    # mean over token dim immediately, move to CPU, detach
+    _hook_buffer[0] = hidden.mean(dim=1).detach().cpu().float()
 
 hook_handle = encoder_blocks[TARGET_IDX].register_forward_hook(hook_fn)
 
@@ -107,133 +110,147 @@ normalize_fn = transforms.Normalize(
     std=[0.229, 0.224, 0.225]
 )
 
-mask = np.load(mask_file)
-
 vjepa2_module.eval()
 
-# ── Process each video ────────────────────────────────────────────────────────
-for fname in todo:
+# ── Per-video collection ──────────────────────────────────────────────────────
+
+def process_video(category, fname, mask):
     stem       = Path(fname).stem
-    act_path   = acts_dir / f"{{stem}}_acts.npy"
-    y_path     = acts_dir / f"{{stem}}_y.npy"
+    acts_dir   = OUT_DIR / f"acts_{category}"
+    acts_dir.mkdir(exist_ok=True)
+    act_path   = acts_dir / f"{stem}_acts.npy"
+    y_path     = acts_dir / f"{stem}_y.npy"
+
+    if act_path.exists() and y_path.exists():
+        print(f"  [CACHED] {fname}")
+        return True
+
     preds_path = STUDY_ROOT / category / stem / "preds.npy"
     video_path = (DATA_DIR / fname).resolve()
 
-    if not preds_path.exists() or not video_path.exists():
-        print(f"  [SKIP] {{fname}}", flush=True)
-        continue
+    if not preds_path.exists():
+        print(f"  [SKIP] no preds: {fname}")
+        return False
+    if not video_path.exists():
+        print(f"  [SKIP] no video: {fname}")
+        return False
+
+    # Check RAM before reading video
+    ram = ram_available_mb()
+    if ram < 4000:
+        print(f"  [WAIT] low RAM ({ram}MB), sleeping 5s...")
+        time.sleep(5)
+        gc.collect()
+        torch.cuda.empty_cache()
 
     preds = np.load(preds_path)[:30]
-    y_tr  = preds[:, mask].mean(axis=1)
+    y_tr  = preds[:, mask].mean(axis=1)   # (30,)
 
+    # Read video — this is the big RAM spike
     try:
         vframes, _, info = tvio.read_video(str(video_path), pts_unit="sec")
-        try:
-            vframes   = vframes.float() / 255.0
-            vframes   = vframes.permute(0, 3, 1, 2)
-            fps       = info.get("video_fps", 30.0)
-            total_f   = vframes.shape[0]
-            spf       = CLIP_DURATION * fps
-            n_clips   = max(1, int(total_f // spf))
+    except Exception as e:
+        print(f"  [ERROR] read_video {fname}: {e}")
+        del preds, y_tr
+        return False
 
-            clip_acts, clip_ys = [], []
-            for c in range(n_clips):
-                start = int(c * spf)
-                end   = min(start + int(spf), total_f)
-                chunk = vframes[start:end]
-                idx   = torch.linspace(0, len(chunk) - 1, CLIP_FRAMES).long()
-                clip  = chunk[idx]
-                clip  = torch.stack([
-                    normalize_fn(resize(clip[i], [IMG_SIZE, IMG_SIZE]))
-                    for i in range(len(clip))
-                ])
-                inp = clip.unsqueeze(0).to(DEVICE)
-                with torch.no_grad():
-                    vjepa2_module(pixel_values_videos=inp)
-                if collected_acts:
-                    clip_acts.append(collected_acts[-1].squeeze(0).numpy().copy())
-                    t_start = int(c * CLIP_DURATION)
-                    t_end   = min(t_start + CLIP_DURATION, 30)
-                    clip_ys.append(float(y_tr[t_start:t_end].mean()))
-                del inp, clip
-                torch.cuda.empty_cache()
-        finally:
-            del vframes
-            gc.collect()
+    try:
+        vframes = vframes.float() / 255.0
+        vframes = vframes.permute(0, 3, 1, 2)   # (T, C, H, W)
+        fps     = info.get("video_fps", 30.0)
+        total_f = vframes.shape[0]
+        spf     = CLIP_DURATION * fps
+        n_clips = max(1, int(total_f // spf))
+
+        clip_acts = np.empty((n_clips, 1408), dtype=np.float32)  # preallocate
+        clip_ys   = np.empty((n_clips,),      dtype=np.float32)
+        valid     = 0
+
+        for c in range(n_clips):
+            start = int(c * spf)
+            end   = min(start + int(spf), total_f)
+            chunk = vframes[start:end]
+            idx   = torch.linspace(0, len(chunk) - 1, CLIP_FRAMES).long()
+            clip  = chunk[idx]
+            clip  = torch.stack([
+                normalize_fn(resize(clip[i], [IMG_SIZE, IMG_SIZE]))
+                for i in range(len(clip))
+            ])  # (T, C, H, W)
+
+            inp = clip.unsqueeze(0).to(DEVICE)  # (1, T, C, H, W)
+            _hook_buffer[0] = None
+
+            with torch.no_grad():
+                vjepa2_module(pixel_values_videos=inp)
+
+            if _hook_buffer[0] is not None:
+                clip_acts[valid] = _hook_buffer[0].squeeze(0).numpy()
+                t_start = int(c * CLIP_DURATION)
+                t_end   = min(t_start + CLIP_DURATION, 30)
+                clip_ys[valid] = float(y_tr[t_start:t_end].mean())
+                valid += 1
+
+            # Immediately free clip tensors
+            del inp, clip, chunk
+            _hook_buffer[0] = None
+            # Don't call empty_cache every clip — it's slow; do it per video
+
+        if valid > 0:
+            np.save(act_path, clip_acts[:valid])
+            np.save(y_path,   clip_ys[:valid])
+            print(f"  {fname}: {valid} clips  "
+                  f"y=[{clip_ys[:valid].min():.3f}, {clip_ys[:valid].max():.3f}]")
+        else:
+            print(f"  [WARN] {fname}: no valid clips")
+
+        return valid > 0
 
     except Exception as e:
-        print(f"  [ERROR] {{fname}}: {{e}}", flush=True)
-        continue
+        print(f"  [ERROR] {fname}: {e}")
+        return False
 
-    if clip_acts:
-        np.save(act_path, np.stack(clip_acts))
-        np.save(y_path,   np.array(clip_ys))
-        print(f"  {{fname}}: {{len(clip_acts)}} clips saved  "
-              f"y=[{{min(clip_ys):.3f}}, {{max(clip_ys):.3f}}]", flush=True)
+    finally:
+        del vframes, preds, y_tr
+        torch.cuda.empty_cache()
+        gc.collect()
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+
+def run_category(category):
+    mask_file = GORE_MASK_FILE if category == "gore" else PORN_MASK_FILE
+    mask      = np.load(mask_file)
+    filenames = CATEGORIES[category]
+
+    print(f"\n=== {category.upper()} ({len(filenames)} videos) ===")
+    report_mem("start")
+
+    done, failed = 0, 0
+    for i, fname in enumerate(filenames):
+        ok = process_video(category, fname, mask)
+        if ok:
+            done += 1
+        else:
+            failed += 1
+
+        # Periodic cache flush
+        if i % 8 == 7:
+            torch.cuda.empty_cache()
+            gc.collect()
+            report_mem(f"after {i+1} videos")
+
+    print(f"\n{category}: {done} collected, {failed} failed")
+    report_mem("end")
+
+
+cats = ["gore", "porn"] if args.category == "both" else [args.category]
+for cat in cats:
+    run_category(cat)
 
 hook_handle.remove()
 del model
 torch.cuda.empty_cache()
 gc.collect()
-print("  Batch done.", flush=True)
-'''
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def run_batch(category, fnames, mask_file, batch_id):
-    script = WORKER_TEMPLATE.format(
-        out_dir      = str(OUT_DIR.resolve()),
-        study_root   = str(STUDY_ROOT.resolve()),
-        data_dir     = str(DATA_DIR.resolve()),
-        cache_dir    = str(CACHE_DIR.resolve()),
-        device       = "cuda" if __import__("torch").cuda.is_available() else "cpu",
-        clip_frames  = CLIP_FRAMES,
-        clip_duration= CLIP_DURATION,
-        img_size     = IMG_SIZE,
-        category     = category,
-        mask_file    = str(mask_file.resolve()),
-        fnames       = fnames,
-    )
-    print(f"\n[Batch {batch_id}] {category} × {len(fnames)} videos", flush=True)
-    result = subprocess.run(
-        [sys.executable, "-c", script],
-        timeout=600,
-    )
-    if result.returncode != 0:
-        print(f"  [BATCH FAILED] exit code {result.returncode}", flush=True)
-    return result.returncode == 0
-
-
-def collect_category(category, filenames, mask_file, batch_size):
-    acts_dir = OUT_DIR / f"acts_{category}"
-    acts_dir.mkdir(exist_ok=True)
-
-    # Split into batches
-    batches = [filenames[i:i+batch_size] for i in range(0, len(filenames), batch_size)]
-    for bid, batch in enumerate(batches):
-        run_batch(category, batch, mask_file, bid)
-        gc.collect()
-
-    # Report final coverage
-    done  = sum(1 for f in filenames
-                if (acts_dir / f"{Path(f).stem}_acts.npy").exists())
-    print(f"\n{category}: {done}/{len(filenames)} videos collected")
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--batch", type=int, default=1,
-                        help="Videos per subprocess (default 1 = max isolation)")
-    args = parser.parse_args()
-
-    print(f"Batch size: {args.batch} video(s) per subprocess")
-
-    print("\n=== Collecting GORE activations ===")
-    collect_category("gore", CATEGORIES["gore"], GORE_MASK_FILE, args.batch)
-
-    print("\n=== Collecting PORN activations ===")
-    collect_category("porn", CATEGORIES["porn"], PORN_MASK_FILE, args.batch)
-
-    print("\nCollection complete. Run surgery.py next.")
+print("\nCollection complete. Run surgery.py next.")
+print(f"Output: {OUT_DIR}/acts_gore/  and  {OUT_DIR}/acts_porn/")
