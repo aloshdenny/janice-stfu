@@ -36,8 +36,8 @@ GORE_MASK_FILE = MASK_DIR / "gore_no_food_strict.npy"
 PORN_MASK_FILE = MASK_DIR / "porn_no_food_strict.npy"
 
 CATEGORIES = {
-    "gore": [f"gore{i}.mp4" for i in range(1, 25)],
-    "porn": [f"porn{i}.mp4" for i in range(1, 25)],
+    "gore": [f"gore{i}.mp4" for i in range(1, 49)],
+    "porn": [f"porn{i}.mp4" for i in range(1, 49)],
 }
 
 # ── Load model ────────────────────────────────────────────────────────────────
