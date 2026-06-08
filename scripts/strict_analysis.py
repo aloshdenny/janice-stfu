@@ -86,10 +86,41 @@ for name, data in CONTRASTS.items():
     mean_val = float(data[mask].mean()) if mask.sum() > 0 else 0
     print(f"  {name:23s}  {mask.sum():8d}  {lh:6d}  {rh:6d}  {mean_val:10.4f}")
 
+# Option 3: Logical AND (no percentile thresholding)
+name = "gore_strict_bicontrast"
+mask = (means["gore"] - means["food"] > 0) & \
+       (means["gore"] - means["porn"] > 0) & \
+       (means["gore"] - means["cute"] > 0)
+new_masks[name] = mask
+lh = mask[:10242].sum()
+rh = mask[10242:].sum()
+bicontrast_data = np.minimum(np.minimum(means["gore"] - means["food"], means["gore"] - means["porn"]), means["gore"] - means["cute"])
+mean_val = float(bicontrast_data[mask].mean()) if mask.sum() > 0 else 0
+print(f"  {name:23s}  {mask.sum():8d}  {lh:6d}  {rh:6d}  {mean_val:10.4f}")
+
+# Option 3 (fully strict): gore is greater than all other categories
+name_all = "gore_strict_multivariate_all"
+mask_all = (means["gore"] - means["food"] > 0) & \
+           (means["gore"] - means["porn"] > 0) & \
+           (means["gore"] - means["cute"] > 0) & \
+           (means["gore"] - means["nature"] > 0) & \
+           (means["gore"] - means["kissing"] > 0) & \
+           (means["gore"] - means["chase"] > 0) & \
+           (means["gore"] - means["fight"] > 0)
+new_masks[name_all] = mask_all
+lh_all = mask_all[:10242].sum()
+rh_all = mask_all[10242:].sum()
+multivariate_data = means["gore"]
+for c in CATEGORIES:
+    if c != "gore":
+        multivariate_data = np.minimum(multivariate_data, means["gore"] - means[c])
+mean_val_all = float(multivariate_data[mask_all].mean()) if mask_all.sum() > 0 else 0
+print(f"  {name_all:23s}  {mask_all.sum():8d}  {lh_all:6d}  {rh_all:6d}  {mean_val_all:10.4f}")
+
 # ── Selectivity check ──────────────────────────────────────────────────────
 print("\nSelectivity check (mean activation per category in each mask):")
 print(f"{'Category':12s}", end="")
-for name in CONTRASTS:
+for name in new_masks:
     print(f"  {name[:12]:>12}", end="")
 print()
 print("-" * 100)
@@ -106,13 +137,14 @@ for cat in CATEGORIES:
         print(f"  {val:12.4f}", end="")
     print()
 
-# ── Pick best masks based on selectivity ──────────────────────────────────
-# Best mask = highest (target - mean_of_others) in that mask
+# ── Selectivity score (target activation - mean of all other categories):
 print("\nSelectivity score (target activation - mean of all other categories):")
 for target_cat, mask_name in [("porn", "porn_specific"), ("gore", "gore_specific"),
                                ("porn", "porn_tight"),    ("gore", "gore_tight"),
                                ("porn", "porn_allneutral"),("gore","gore_allneutral"),
-                               ("porn", "porn_no_food"),   ("gore", "gore_no_food")]:
+                               ("porn", "porn_no_food"),   ("gore", "gore_no_food"),
+                               ("gore", "gore_strict_bicontrast"),
+                               ("gore", "gore_strict_multivariate_all")]:
     mask = new_masks[mask_name]
     if mask.sum() == 0:
         continue
@@ -123,17 +155,18 @@ for target_cat, mask_name in [("porn", "porn_specific"), ("gore", "gore_specific
     print(f"  {target_cat:6s} in {mask_name:20s}: target={target_val:.4f}  others={other_val:.4f}  score={score:+.4f}")
 
 # ── Food selectivity sanity check ─────────────────────────────────────────
-if "gore_no_food" in new_masks:
-    gore_mask_to_check = new_masks["gore_no_food"]
-    gore_act = float(means["gore"][gore_mask_to_check].mean())
-    food_act = float(means["food"][gore_mask_to_check].mean())
-    print("\nFood selectivity sanity check for gore_no_food:")
-    print(f"  Gore activation in Gore mask: {gore_act:.4f}")
-    print(f"  Food activation in Gore mask: {food_act:.4f}")
-    if food_act >= gore_act:
-        print("  WARNING: Food activation is HIGHER than or equal to Gore activation in the Gore mask!")
-    else:
-        print("  ✓ Sanity check passed: Food activation is lower than Gore activation in the Gore mask.")
+for name in ["gore_no_food", "gore_strict_bicontrast", "gore_strict_multivariate_all"]:
+    if name in new_masks:
+        gore_mask_to_check = new_masks[name]
+        gore_act = float(means["gore"][gore_mask_to_check].mean())
+        food_act = float(means["food"][gore_mask_to_check].mean())
+        print(f"\nFood selectivity sanity check for {name}:")
+        print(f"  Gore activation in Gore mask: {gore_act:.4f}")
+        print(f"  Food activation in Gore mask: {food_act:.4f}")
+        if food_act >= gore_act:
+            print(f"  WARNING: Food activation is HIGHER than or equal to Gore activation in the Gore mask!")
+        else:
+            print(f"  ✓ Sanity check passed: Food activation is lower than Gore activation in the Gore mask.")
 
 # ── Save best masks ────────────────────────────────────────────────────────
 MASK_DIR.mkdir(exist_ok=True)
