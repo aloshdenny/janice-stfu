@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from pathlib import Path
 import torchvision.io as tvio
+import av
 from torchvision import transforms
 from torchvision.transforms.functional import resize
 import gc
@@ -30,9 +31,7 @@ CLIP_FRAMES   = 16
 CLIP_DURATION = 4
 IMG_SIZE      = 256
 
-# Gore: strong selective signal (+0.1516)
-# Porn: weak but best available (+0.0455) — will suppress body/skin representation
-GORE_MASK_FILE = MASK_DIR / "gore_no_food_strict.npy"
+GORE_MASK_FILE = MASK_DIR / "gore_strict_bicontrast_strict.npy"
 PORN_MASK_FILE = MASK_DIR / "porn_no_food_strict.npy"
 
 CATEGORIES = {
@@ -78,12 +77,25 @@ hook_handle = encoder_blocks[TARGET_IDX].register_forward_hook(hook_fn)
 normalize_fn = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                     std=[0.229, 0.224, 0.225])
 
+def read_video_pyav(video_path):
+    container = av.open(str(video_path))
+    try:
+        video_stream = container.streams.video[0]
+        video_stream.codec_context.thread_count = 1  # prevent thread explosion/leak
+        frames = []
+        for frame in container.decode(video_stream):
+            frames.append(frame.to_ndarray(format="rgb24"))
+        fps = float(video_stream.average_rate) if video_stream.average_rate else 30.0
+        vframes = torch.from_numpy(np.stack(frames))
+        return vframes, fps
+    finally:
+        container.close()
+
 def iter_clips(video_path):
     """Generator — yields one (T,C,H,W) clip at a time to avoid OOM."""
-    vframes, _, info = tvio.read_video(str(video_path), pts_unit="sec")
+    vframes, fps = read_video_pyav(video_path)
     vframes = vframes.float() / 255.0
     vframes = vframes.permute(0, 3, 1, 2)              # (T,C,H,W)
-    fps     = info.get("video_fps", 30.0)
     total_f = vframes.shape[0]
     spf     = CLIP_DURATION * fps
     n_clips = max(1, int(total_f // spf))
