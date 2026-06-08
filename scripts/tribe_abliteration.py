@@ -98,8 +98,16 @@ act_path  = acts_dir / f"{{stem}}_acts.npy"
 y_path    = acts_dir / f"{{stem}}_y.npy"
 
 if act_path.exists() and y_path.exists():
-    print(f"  [CACHED] {{fname}}")
-    exit(0)
+    try:
+        import numpy as np
+        cached_y = np.load(y_path)
+        if not np.isnan(cached_y).any():
+            print(f"  [CACHED] {{fname}}")
+            exit(0)
+        else:
+            print(f"  [INVALID CACHE] {{fname}} has NaNs in cached y. Regenerating...")
+    except Exception:
+        pass
 
 preds_path = STUDY_ROOT / category / stem / "preds.npy"
 video_path = (DATA_DIR / fname).resolve()
@@ -109,7 +117,11 @@ if not preds_path.exists() or not video_path.exists():
 
 mask = np.load("{mask_file}")
 preds = np.load(preds_path)[:30]
+if mask.sum() == 0:
+    raise ValueError("Mask is empty! Cannot compute y_tr. Check your mask file.")
 y_tr  = preds[:, mask].mean(axis=1)
+if np.isnan(y_tr).any():
+    raise ValueError("NaNs detected in y_tr!")
 
 model = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
 vjepa2_module  = model.data.video_feature.image.model.model
@@ -224,8 +236,18 @@ gc.collect()
 # ── Weighted PCA ──────────────────────────────────────────────────────────────
 
 def find_directions(X, y, n_components=1, label=""):  # reduce to 1 component
-    weights  = (y - y.min()) / (y.max() - y.min() + 1e-9)
-    weights /= weights.sum()
+    if np.isnan(y).any():
+        raise ValueError(f"[{label}] target variable y contains NaNs! SVD will fail.")
+    
+    y_min, y_max = y.min(), y.max()
+    y_range = y_max - y_min
+    if y_range < 1e-9:
+        print(f"  [{label}] y is constant (range < 1e-9), using uniform weights")
+        weights = np.ones_like(y) / len(y)
+    else:
+        weights  = (y - y_min) / (y_range + 1e-9)
+        weights /= weights.sum()
+        
     X_mean   = (X * weights[:, None]).sum(axis=0, keepdims=True)
     X_c      = (X - X_mean) * np.sqrt(weights[:, None])
     _, S, Vt = np.linalg.svd(X_c, full_matrices=False)

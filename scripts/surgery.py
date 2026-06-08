@@ -52,15 +52,27 @@ def load_category(category, filenames):
     acts_dir = OUT_DIR / f"acts_{category}"
     X_list, y_list = [], []
     missing = []
+    nan_files = []
     for fname in filenames:
         stem     = Path(fname).stem
         act_path = acts_dir / f"{stem}_acts.npy"
         y_path   = acts_dir / f"{stem}_y.npy"
         if act_path.exists() and y_path.exists():
-            X_list.append(np.load(act_path))
-            y_list.append(np.load(y_path))
+            X_val = np.load(act_path)
+            y_val = np.load(y_path)
+            if np.isnan(y_val).any():
+                nan_files.append(y_path.name)
+            X_list.append(X_val)
+            y_list.append(y_val)
         else:
             missing.append(fname)
+    if nan_files:
+        print(f"  [{category}] WARNING: {len(nan_files)} target files contain NaNs:")
+        print(f"    {nan_files[:5]}{'...' if len(nan_files)>5 else ''}")
+        raise ValueError(
+            f"Target variable y contains NaNs in category {category}. "
+            f"Please delete the corrupted files and rerun collect_acts.py."
+        )
     if missing:
         print(f"  [{category}] WARNING: {len(missing)} files missing — "
               f"run collect_acts.py first")
@@ -83,8 +95,18 @@ gc.collect()
 # ── Weighted PCA ──────────────────────────────────────────────────────────────
 
 def find_directions(X, y, n_components, label):
-    weights  = (y - y.min()) / (y.max() - y.min() + 1e-9)
-    weights /= weights.sum()
+    if np.isnan(y).any():
+        raise ValueError(f"[{label}] target variable y contains NaNs! SVD will fail.")
+    
+    y_min, y_max = y.min(), y.max()
+    y_range = y_max - y_min
+    if y_range < 1e-9:
+        print(f"  [{label}] y is constant (range < 1e-9), using uniform weights")
+        weights = np.ones_like(y) / len(y)
+    else:
+        weights  = (y - y_min) / (y_range + 1e-9)
+        weights /= weights.sum()
+        
     X_mean   = (X * weights[:, None]).sum(axis=0, keepdims=True)
     X_c      = (X - X_mean) * np.sqrt(weights[:, None])
     _, S, Vt = np.linalg.svd(X_c, full_matrices=False)

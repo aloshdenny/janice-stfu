@@ -121,8 +121,15 @@ def process_video(category, fname, mask):
     y_path   = acts_dir / f"{stem}_y.npy"
 
     if act_path.exists() and y_path.exists():
-        print(f"  [CACHED] {fname}")
-        return True
+        try:
+            cached_y = np.load(y_path)
+            if not np.isnan(cached_y).any():
+                print(f"  [CACHED] {fname}")
+                return True
+            else:
+                print(f"  [INVALID CACHE] {fname} has NaNs in cached y. Regenerating...")
+        except Exception:
+            pass
 
     preds_path = STUDY_ROOT / category / stem / "preds.npy"
     video_path = (DATA_DIR / fname).resolve()
@@ -142,7 +149,11 @@ def process_video(category, fname, mask):
         torch.cuda.empty_cache()
 
     preds = np.load(preds_path)[:30]
+    if mask.sum() == 0:
+        raise ValueError(f"Mask is empty! Cannot compute y_tr. Check your mask file.")
     y_tr  = preds[:, mask].mean(axis=1)   # (30,)
+    if np.isnan(y_tr).any():
+        raise ValueError(f"NaNs detected in y_tr for {fname}! preds has NaNs: {np.isnan(preds).any()}")
 
     # Open VideoReader — only a handful of frames in memory at once
     try:
