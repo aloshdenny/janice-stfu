@@ -136,30 +136,52 @@ cache_dict = model_abl.data.video_feature.infra.cache_dict
 item_uid = model_abl.data.video_feature.infra.item_uid
 helper = model_abl.data.video_feature._event_types_helper
 
-# Force population of cache keys by calling keys() or __contains__
+# 1. Clear in-memory cache
 all_keys = list(cache_dict.keys())
 print(f"  Total keys currently in cache_dict: {len(all_keys)}")
-if len(all_keys) > 0:
-    print(f"  Sample cache keys: {all_keys[:5]}")
-
 for vp in val_videos:
     df = make_video_only_df(vp)
     events = helper.extract(df)
     for event in events:
         key = item_uid(event)
-        print(f"  Checking validation key: {key}")
         if key in cache_dict:
-            print(f"    -> Found! Deleting cache key: {key}")
+            print(f"    -> Deleting in-memory cache key: {key}")
             del cache_dict[key]
-            # Confirm deletion
-            if key not in cache_dict:
-                print(f"    -> Verified deleted from cache_dict")
-            else:
-                print(f"    -> WARNING: Failed to delete from cache_dict!")
-        else:
-            print(f"    -> Key not found in cache_dict")
 
-print(f"  Total keys in cache_dict after deletion: {len(list(cache_dict.keys()))}")
+# 2. Clear disk cache recursively (important to prevent cross-run cache hits)
+print("  Clearing disk cache for validation videos...")
+import json
+val_names = {vp.name for vp in val_videos}
+val_resolved = {str(vp.resolve()) for vp in val_videos}
+deleted_count = 0
+
+if CACHE_BASE.exists():
+    for info_file in CACHE_BASE.rglob("*info.jsonl"):
+        try:
+            lines = info_file.read_text().splitlines()
+            match = False
+            for line in lines:
+                try:
+                    data = json.loads(line)
+                    for k, v in data.items():
+                        if isinstance(v, str):
+                            if v in val_resolved or Path(v).name in val_names:
+                                match = True
+                                break
+                except Exception:
+                    pass
+                if match:
+                    break
+            
+            if match:
+                parent_dir = info_file.parent
+                print(f"    -> Deleting disk cache folder: {parent_dir}")
+                shutil.rmtree(parent_dir)
+                deleted_count += 1
+        except Exception as e:
+            print(f"    -> Error processing {info_file}: {e}")
+
+print(f"  Cleared {deleted_count} cache folders from disk.")
 print("Cache cleared — abliterated model will recompute features from scratch\n")
 
 # ── Phase 3: run inference ────────────────────────────────────────────────────

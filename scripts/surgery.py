@@ -35,8 +35,8 @@ CATEGORIES = {
 # ── Args ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--alpha",        type=float, default=0.5,
-                    help="Suppression strength 0–1 (default 0.5)")
+parser.add_argument("--alpha",        type=float, default=0.2,
+                    help="Suppression strength 0–1 (default 0.2)")
 parser.add_argument("--n_components", type=int,   default=1,
                     help="PCA components per category (default 1)")
 parser.add_argument("--gore_only",    action="store_true",
