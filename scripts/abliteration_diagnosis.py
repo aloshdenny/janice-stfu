@@ -375,13 +375,26 @@ def _fingerprint_weights(encoder_blocks, layer_indices):
     return total
 
 
+def _find_data_files(cache_dir: Path):
+    """Return all .data memmap files under cache_dir."""
+    return list(cache_dir.rglob("*.data"))
+
+
+def _get_cache_layer_idx(n_layers: int, cache_n_layers: int, target_layer: int) -> int:
+    """
+    exca caches the last cache_n_layers encoder layers.
+    Layer index within the cache = target_layer - (n_layers - cache_n_layers).
+    """
+    first_cached = n_layers - cache_n_layers
+    return target_layer - first_cached
+
+
 def evaluate_layer_suppression(directions, validation_video):
     print(f"\n=== Step 3: Running Validation Inference on {validation_video.name} ===")
 
     gore_mask = np.load(GORE_MASK_FILE)
     porn_mask = np.load(PORN_MASK_FILE)
 
-    # Load baseline predictions for the video
     stem = validation_video.stem
     base_preds_path = STUDY_ROOT / "gore" / stem / "preds.npy"
     if not base_preds_path.exists():
@@ -406,9 +419,56 @@ def evaluate_layer_suppression(directions, validation_video):
     print(f"  Porn Mask Mean: {base_porn_mean:.4f}")
     print(f"  Whole Brain Mean: {base_wb_mean:.4f}")
 
-    comparison_results = []
+    # ── Load model once; determine cache geometry ──────────────────────────────
+    # Nuke any stale cache first so the first predict() re-runs the encoder
+    # and writes a fresh .data file we can inspect and patch.
+    _nuke_cache_for_video(validation_video)
 
-    # Test each layer individually and a few multi-layer combinations
+    print("  Loading model and running baseline predict() to seed cache...")
+    model = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
+    vjepa2_module  = model.data.video_feature.image.model.model
+    encoder_blocks = vjepa2_module.encoder.layer
+    N_LAYERS       = len(encoder_blocks)
+
+    # Derive cache_n_layers from the cache key string in the subdir name.
+    # The dump showed: "...image={cache_n_layers=20,..."
+    # We read it from the model attribute if available, else default 20.
+    try:
+        cache_n_layers = model.data.video_feature.image.cache_n_layers
+    except AttributeError:
+        cache_n_layers = 20
+    print(f"  N_LAYERS={N_LAYERS}  cache_n_layers={cache_n_layers}")
+
+    df = make_video_only_df(validation_video)
+    _, _ = model.predict(events=df)   # seeds the cache
+
+    # Find the .data files that just appeared
+    data_files = _find_data_files(CACHE_DIR)
+    print(f"  Found {len(data_files)} .data file(s) after baseline predict:")
+    for f in data_files:
+        print(f"    {f}  ({f.stat().st_size} bytes)")
+
+    if not data_files:
+        raise RuntimeError("No .data files found in cache after baseline predict(). "
+                           "exca may not be using memmap storage in this environment.")
+
+    # Load baseline memmap content — shape should be (cache_n_layers, 1408, n_clips)
+    # We keep a pristine copy in RAM to restore between test cases.
+    baseline_arrays = {}
+    for df_path in data_files:
+        try:
+            arr = np.load(str(df_path), mmap_mode="r")
+            baseline_arrays[df_path] = arr.copy()
+            print(f"  Loaded baseline array {arr.shape} dtype={arr.dtype} from {df_path.name}")
+        except Exception as e:
+            print(f"  [WARN] Could not load {df_path.name}: {e}")
+
+    del model, vjepa2_module
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # ── Per-case loop ──────────────────────────────────────────────────────────
+    comparison_results = []
     test_cases = [(L,) for L in CANDIDATE_LAYERS] + [
         (28, 30, 32),
         (30, 32),
@@ -418,75 +478,65 @@ def evaluate_layer_suppression(directions, validation_video):
         case_name = "+".join(map(str, case))
         print(f"\nEvaluating abliteration on Layer(s): {case_name}")
 
-        # ── 1. Nuke the on-disk cache for this video BEFORE loading the model.
-        #    This prevents the freshly-loaded model from immediately reading a
-        #    stale cache entry that was written by the previous iteration.
-        n_deleted = _nuke_cache_for_video(validation_video)
-        print(f"  [CACHE] Deleted {n_deleted} cache dirs for {validation_video.name}")
+        # Build ortho directions for this case
+        all_dirs = []
+        for L in case:
+            all_dirs.extend([directions[L]["gore"], directions[L]["porn"]])
+        dirs_t = torch.tensor(np.stack(all_dirs), dtype=torch.float32)
+        ortho = []
+        for d in dirs_t:
+            for q in ortho:
+                d = d - (d @ q) * q
+            if d.norm() > 1e-6:
+                ortho.append(d / d.norm())
+        ortho_np = np.stack([q.numpy() for q in ortho])  # (n_dirs, 1408)
 
-        # ── 2. Load a fresh model instance.
-        model = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
-        vjepa2_module  = model.data.video_feature.image.model.model
-        encoder_blocks = vjepa2_module.encoder.layer
+        # Patch the .data files in-place: for each candidate layer in this
+        # case, project its direction out of the corresponding cache slice.
+        patched_any = False
+        for df_path, baseline_arr in baseline_arrays.items():
+            arr = baseline_arr.copy()
+            # arr shape: (cache_n_layers, 1408, n_clips)  OR other shapes
+            if arr.ndim != 3 or arr.shape[1] != 1408:
+                print(f"  [SKIP] {df_path.name} has unexpected shape {arr.shape}")
+                continue
 
-        # ── 3. Also clear the in-memory cache_dict on every infra we can reach,
-        #    just in case a previous iteration populated it.
-        #    cache_dict is a property that raises ValueError when the infra has
-        #    neither folder nor keep_in_ram configured, so catch both.
-        for attr_path in [
-            "data.video_feature.infra",
-            "data.video_feature.image.infra",
-        ]:
+            for L in case:
+                cache_idx = _get_cache_layer_idx(N_LAYERS, cache_n_layers, L)
+                if not (0 <= cache_idx < arr.shape[0]):
+                    print(f"  [WARN] Layer {L} -> cache_idx={cache_idx} out of range [0,{arr.shape[0]})")
+                    continue
+
+                # slice: (1408, n_clips)
+                sl = torch.from_numpy(arr[cache_idx].copy()).float()
+                for q in ortho:
+                    # Project q out: sl = sl - alpha * q (q^T sl)
+                    sl = sl - 0.2 * q.unsqueeze(1) * (q @ sl).unsqueeze(0)
+                arr[cache_idx] = sl.numpy().astype(arr.dtype)
+                patched_any = True
+                print(f"  [PATCH] Layer {L} -> cache_idx={cache_idx} patched in {df_path.name}")
+
+            if patched_any:
+                # Write modified array back over the memmap file
+                np.save(str(df_path), arr)
+
+        if not patched_any:
+            print(f"  [WARN] No .data files were patched — results will equal baseline")
+
+        # Also clear in-memory cache so exca re-reads from the patched file
+        model2 = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
+        for attr_path in ["data.video_feature.infra", "data.video_feature.image.infra"]:
             try:
-                infra = model
+                infra = model2
                 for part in attr_path.split("."):
                     infra = getattr(infra, part)
                 for k in list(infra.cache_dict.keys()):
                     del infra.cache_dict[k]
-            except (AttributeError, ValueError, Exception):
+            except Exception:
                 pass
 
-        # ── 4. Snapshot weight fingerprint before surgery (sanity check).
-        fp_before = _fingerprint_weights(encoder_blocks, case)
-
-        # ── 5. Apply surgery.
-        alpha = 0.2
-        for L in case:
-            dir_g = directions[L]["gore"]
-            dir_p = directions[L]["porn"]
-            dirs_t = torch.tensor(np.stack([dir_g, dir_p]), dtype=torch.float32).to(DEVICE)
-
-            ortho = []
-            for d in dirs_t:
-                for q in ortho:
-                    d = d - (d @ q) * q
-                if d.norm() > 1e-6:
-                    ortho.append(d / d.norm())
-            ortho = torch.stack(ortho)
-
-            block = encoder_blocks[L]
-            for layer_name in ["attention.value", "attention.proj"]:
-                mod = block
-                for p in layer_name.split("."):
-                    mod = getattr(mod, p)
-                W = mod.weight.data.clone()
-                for q in ortho:
-                    W -= alpha * (W @ q).unsqueeze(-1) * q
-                mod.weight.data = W
-
-        # ── 6. Confirm weights actually changed.
-        fp_after = _fingerprint_weights(encoder_blocks, case)
-        weight_delta = abs(fp_after - fp_before)
-        if weight_delta < 1e-6:
-            print(f"  [WARN] Weight fingerprint unchanged (Δ={weight_delta:.2e}) — surgery may not have applied!")
-        else:
-            print(f"  [OK] Weights modified (fingerprint Δ={weight_delta:.4f})")
-
-        # ── 7. Run inference.  Because the cache was nuked in step 1 and the
-        #    in-memory dict was cleared in step 3, exca must re-run the forward
-        #    pass through the now-modified weights.
-        df = make_video_only_df(validation_video)
-        preds_abl, _ = model.predict(events=df)
+        df2 = make_video_only_df(validation_video)
+        preds_abl, _ = model2.predict(events=df2)
         preds_abl = preds_abl[:30]
 
         abl_gore_mean = float(preds_abl[:, gore_mask].mean())
@@ -495,12 +545,10 @@ def evaluate_layer_suppression(directions, validation_video):
 
         gore_diff = abl_gore_mean - base_gore_mean
         gore_pct  = 100 * gore_diff / (abs(base_gore_mean) + 1e-9)
-
         porn_diff = abl_porn_mean - base_porn_mean
         porn_pct  = 100 * porn_diff / (abs(base_porn_mean) + 1e-9)
-
-        wb_diff = abl_wb_mean - base_wb_mean
-        wb_pct  = 100 * wb_diff / (abs(base_wb_mean) + 1e-9)
+        wb_diff   = abl_wb_mean - base_wb_mean
+        wb_pct    = 100 * wb_diff / (abs(base_wb_mean) + 1e-9)
 
         print(f"  Gore Mask: {base_gore_mean:.4f} -> {abl_gore_mean:.4f} (Δ={gore_diff:+.4f}, {gore_pct:+.1f}%)")
         print(f"  Porn Mask: {base_porn_mean:.4f} -> {abl_porn_mean:.4f} (Δ={porn_diff:+.4f}, {porn_pct:+.1f}%)")
@@ -508,21 +556,23 @@ def evaluate_layer_suppression(directions, validation_video):
 
         comparison_results.append({
             "layers": case_name,
-            "gore_delta": gore_diff,
-            "gore_pct": gore_pct,
-            "porn_delta": porn_diff,
-            "porn_pct": porn_pct,
-            "wb_delta": wb_diff,
-            "wb_pct": wb_pct,
+            "gore_delta": gore_diff, "gore_pct": gore_pct,
+            "porn_delta": porn_diff, "porn_pct": porn_pct,
+            "wb_delta": wb_diff,     "wb_pct": wb_pct,
         })
 
-        del model, vjepa2_module
+        del model2
         torch.cuda.empty_cache()
         gc.collect()
 
-    return comparison_results
+        # Restore baseline .data files for next iteration
+        for df_path, baseline_arr in baseline_arrays.items():
+            try:
+                np.save(str(df_path), baseline_arr)
+            except Exception as e:
+                print(f"  [WARN] Could not restore {df_path.name}: {e}")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+    return comparison_results
 
 if __name__ == "__main__":
     # Choose validation video (gore1.mp4)
