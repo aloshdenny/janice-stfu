@@ -293,14 +293,16 @@ def evaluate_layer_suppression(directions, validation_video):
         vjepa2_module = model.data.video_feature.image.model.model
         encoder_blocks = vjepa2_module.encoder.layer
         
-        # Clear exca cache to force forward pass
-        infra = model.data.video_feature.infra
-        for k in list(infra.cache_dict.keys()):
-            del infra.cache_dict[k]
-        uid_folder = infra.uid_folder()
-        if uid_folder is not None and uid_folder.exists():
-            shutil.rmtree(uid_folder)
-            uid_folder.mkdir(parents=True, exist_ok=True)
+        # Clear exca caches for both video and image extractors to force forward pass
+        video_infra = model.data.video_feature.infra
+        image_infra = model.data.video_feature.image.infra
+        for infra in [video_infra, image_infra]:
+            for k in list(infra.cache_dict.keys()):
+                del infra.cache_dict[k]
+            uid_folder = infra.uid_folder()
+            if uid_folder is not None and uid_folder.exists():
+                shutil.rmtree(uid_folder)
+                uid_folder.mkdir(parents=True, exist_ok=True)
             
         # Apply surgery to all layers in the case
         for L in case:
