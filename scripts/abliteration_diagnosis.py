@@ -44,8 +44,8 @@ DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
 CANDIDATE_LAYERS = [20, 24, 28, 30, 32, 36, 39]
 DIAG_VIDEOS = {
-    "gore": [f"gore{i}.mp4" for i in range(1, 9)],
-    "porn": [f"porn{i}.mp4" for i in range(1, 9)],
+    "gore": [f"gore{i}.mp4" for i in range(1, 49)],
+    "porn": [f"porn{i}.mp4" for i in range(1, 49)],
 }
 
 # ── Helper: get duration ──────────────────────────────────────────────────────
@@ -300,6 +300,7 @@ def evaluate_layer_suppression(directions, validation_video):
         uid_folder = infra.uid_folder()
         if uid_folder is not None and uid_folder.exists():
             shutil.rmtree(uid_folder)
+            uid_folder.mkdir(parents=True, exist_ok=True)
             
         # Apply surgery to all layers in the case
         for L in case:
