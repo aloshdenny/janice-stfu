@@ -245,33 +245,73 @@ def compute_directions_for_layers(activations):
 
 # ── Step 3: Run Validation & Evaluate Suppression Delta ───────────────────────
 
+def _dump_cache_structure(label=""):
+    """Print the cache directory structure and first lines of every info.jsonl found."""
+    print(f"\n[CACHE DUMP{' ' + label if label else ''}] CACHE_DIR={CACHE_DIR.resolve()}")
+    if not CACHE_DIR.exists():
+        print("  (does not exist)")
+        return
+    for entry in sorted(CACHE_DIR.iterdir()):
+        if not entry.is_dir():
+            print(f"  FILE: {entry.name}")
+            continue
+        files = sorted(entry.iterdir())
+        print(f"  DIR:  {entry.name}/  ({len(files)} items)")
+        for f in files[:6]:
+            if f.name == "info.jsonl":
+                try:
+                    lines = f.read_text().splitlines()
+                    preview = lines[0][:200] if lines else "(empty)"
+                    print(f"    info.jsonl[0]: {preview}")
+                    if len(lines) > 1:
+                        print(f"    info.jsonl[1]: {lines[1][:200]}")
+                except OSError as e:
+                    print(f"    info.jsonl: (read error: {e})")
+            elif f.is_dir():
+                sub_files = list(f.iterdir())
+                print(f"    subdir: {f.name}/  ({len(sub_files)} items)")
+                for sf in sub_files[:3]:
+                    if sf.name == "info.jsonl":
+                        try:
+                            lines = sf.read_text().splitlines()
+                            preview = lines[0][:200] if lines else "(empty)"
+                            print(f"      info.jsonl[0]: {preview}")
+                        except OSError:
+                            pass
+            else:
+                print(f"    {f.name} ({f.stat().st_size} bytes)")
+    print("[END CACHE DUMP]\n")
+
+
+_debug_first_call = [True]
+
 def _nuke_cache_for_video(video_path: Path):
     """
-    Aggressively clear every exca cache entry that could correspond to this
-    video.  exca uses a content-addressed uid derived from the file path
-    (sometimes absolute, sometimes relative) and stores data under
-    CACHE_DIR/<uid>/.  Because the uid is config-hash-based and all our
-    model variants share the same config, all variants share the same on-disk
-    cache.  We can't rely on uid_folder() either — it often returns None for
-    the image infra that actually caches VJEPA2 activations.
+    Nuke every exca cache entry for this video.
 
-    The safest approach: scan the entire CACHE_DIR for any folder whose
-    info.jsonl references the video filename, and delete it.  Then do a
-    second pass removing any .data memmap file whose parent folder contains
-    matching entries.
+    exca may not store the filename in info.jsonl at all — it may key on a
+    hash of the serialised input dict.  So the safest strategy is:
+      1. Do a filename-string scan (catches cases where path IS in jsonl).
+      2. If that finds nothing on the first call, dump the structure so we
+         can see what exca actually stores.
+      3. Fallback: delete every subdir under CACHE_DIR that contains a .data
+         memmap file (any exca activation cache).  Safe because the only
+         preds we preserve are in tribe_study/, not CACHE_DIR.
     """
     video_name = video_path.name
     video_stem = video_path.stem
-    deleted = 0
+    deleted_by_scan = 0
+
     if not CACHE_DIR.exists():
-        return deleted
-    # Walk all subdirectories one level deep (exca layout: cache/<uid>/...)
+        return 0
+
+    # Pass 1: filename-string scan (two levels deep)
+    dirs_to_delete = []
     for entry in CACHE_DIR.iterdir():
         if not entry.is_dir():
             continue
-        # Check info.jsonl
-        info_file = entry / "info.jsonl"
         matched = False
+        info_file = entry / "info.jsonl"
         if info_file.exists():
             try:
                 text = info_file.read_text()
@@ -279,23 +319,47 @@ def _nuke_cache_for_video(video_path: Path):
                     matched = True
             except OSError:
                 pass
-        # Also check any nested info.jsonl one level deeper
         if not matched:
             for sub in entry.iterdir():
-                if sub.is_dir():
-                    sub_info = sub / "info.jsonl"
-                    if sub_info.exists():
-                        try:
-                            text = sub_info.read_text()
-                            if video_name in text or video_stem in text:
-                                matched = True
-                                break
-                        except OSError:
-                            pass
+                if not sub.is_dir():
+                    continue
+                sub_info = sub / "info.jsonl"
+                if sub_info.exists():
+                    try:
+                        text = sub_info.read_text()
+                        if video_name in text or video_stem in text:
+                            matched = True
+                            break
+                    except OSError:
+                        pass
         if matched:
-            shutil.rmtree(entry)
-            deleted += 1
-    return deleted
+            dirs_to_delete.append(entry)
+
+    for d in dirs_to_delete:
+        shutil.rmtree(d, ignore_errors=True)
+        deleted_by_scan += 1
+
+    if deleted_by_scan == 0 and _debug_first_call[0]:
+        _debug_first_call[0] = False
+        _dump_cache_structure("before first nuke")
+
+    # Pass 2: fallback — delete every subdir that contains a .data memmap.
+    # exca stores activations as <uid>/<key>.data; if the filename scan
+    # found nothing the key doesn't embed the path, so we must delete
+    # everything that looks like an activation cache.
+    deleted_by_fallback = 0
+    if CACHE_DIR.exists():
+        for entry in list(CACHE_DIR.iterdir()):
+            if not entry.is_dir():
+                continue
+            has_data = any(entry.rglob("*.data"))
+            if has_data:
+                shutil.rmtree(entry, ignore_errors=True)
+                deleted_by_fallback += 1
+
+    total = deleted_by_scan + deleted_by_fallback
+    print(f"  [CACHE] scan={deleted_by_scan} fallback={deleted_by_fallback} dirs nuked")
+    return total
 
 
 def _fingerprint_weights(encoder_blocks, layer_indices):
