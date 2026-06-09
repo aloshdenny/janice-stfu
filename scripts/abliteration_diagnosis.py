@@ -367,6 +367,8 @@ def evaluate_layer_suppression(directions, validation_video):
 
         # ── 3. Also clear the in-memory cache_dict on every infra we can reach,
         #    just in case a previous iteration populated it.
+        #    cache_dict is a property that raises ValueError when the infra has
+        #    neither folder nor keep_in_ram configured, so catch both.
         for attr_path in [
             "data.video_feature.infra",
             "data.video_feature.image.infra",
@@ -377,7 +379,7 @@ def evaluate_layer_suppression(directions, validation_video):
                     infra = getattr(infra, part)
                 for k in list(infra.cache_dict.keys()):
                     del infra.cache_dict[k]
-            except AttributeError:
+            except (AttributeError, ValueError, Exception):
                 pass
 
         # ── 4. Snapshot weight fingerprint before surgery (sanity check).
