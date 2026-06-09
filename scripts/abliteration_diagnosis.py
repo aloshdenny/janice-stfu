@@ -297,6 +297,8 @@ def evaluate_layer_suppression(directions, validation_video):
         video_infra = model.data.video_feature.infra
         image_infra = model.data.video_feature.image.infra
         for infra in [video_infra, image_infra]:
+            if infra.folder is None:
+                continue
             for k in list(infra.cache_dict.keys()):
                 del infra.cache_dict[k]
             uid_folder = infra.uid_folder()
