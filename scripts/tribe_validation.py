@@ -14,7 +14,7 @@ VAL_DIR    = Path("./val_data")
 OUT_DIR    = Path("./abliterated")
 CACHE_BASE = Path("./cache")
 STUDY_ROOT = Path("./tribe_study")
-ALPHA      = 0.5   # change freely — no re-surgery needed
+ALPHA      = 0.1   # change freely — no re-surgery needed
 
 def get_duration(video_path):
     r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
