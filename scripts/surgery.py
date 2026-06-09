@@ -1,180 +1,225 @@
-import os, warnings, logging
+"""
+surgery.py — Phase 2: load cached activations, compute directions, apply surgery.
+Run this after collect_acts.py has finished.
+
+Usage:
+    python surgery.py [--alpha 0.5] [--n_components 1]
+"""
+
+import os, warnings, logging, argparse, gc
 warnings.filterwarnings("ignore")
 logging.disable(logging.WARNING)
-os.environ["PYTHONWARNINGS"] = "ignore"
 
 import numpy as np
 import torch
-import pandas as pd
 from pathlib import Path
 from tribev2.demo_utils import TribeModel
-import gc, subprocess, shutil
 
-VAL_DIR    = Path("./val_data")
-OUT_DIR    = Path("./abliterated")
-CACHE_BASE = Path("./cache")
-STUDY_ROOT = Path("./tribe_study")
+# ── Config ────────────────────────────────────────────────────────────────────
 
-def get_duration(video_path):
-    r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
-                        "-of","default=noprint_wrappers=1:nokey=1",str(video_path)],
-                       capture_output=True, text=True)
-    try: return round(float(r.stdout.strip()) - 0.1, 3)
-    except: return 29.9
+STUDY_ROOT    = Path("./tribe_study")
+MASK_DIR      = STUDY_ROOT / "masks"
+CACHE_DIR     = Path("./cache")
+OUT_DIR       = Path("./abliterated")
 
-def make_video_only_df(video_path):
-    dur = get_duration(video_path)
-    return pd.DataFrame([{"type":"Video","start":0.0,"duration":dur,
-        "timeline":"default","subject":"default","session":"","task":"","run":"",
-        "filepath":str(video_path.resolve()),"frequency":60.0,"offset":0.0,
-        "stop":dur,"context":float("nan")}])
+GORE_MASK_FILE = MASK_DIR / "gore_strict_bicontrast_strict.npy"
+PORN_MASK_FILE = MASK_DIR / "porn_no_food_strict.npy"
 
-# ── Load masks + baseline preds ───────────────────────────────────────────────
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-gore_mask = np.load(OUT_DIR / "gore_mask.npy")
-porn_mask = np.load(OUT_DIR / "porn_mask.npy")
-print(f"Gore mask: {gore_mask.sum()} verts   Porn mask: {porn_mask.sum()} verts")
+CATEGORIES = {
+    "gore": [f"gore{i}.mp4" for i in range(1, 49)],
+    "porn": [f"porn{i}.mp4" for i in range(1, 49)],
+}
 
-val_videos = sorted(VAL_DIR.glob("*.mp4"))
-print(f"Found {len(val_videos)} validation videos")
+# ── Args ──────────────────────────────────────────────────────────────────────
 
-baseline_preds = {}
-for vp in val_videos:
-    for cat_dir in STUDY_ROOT.iterdir():
-        if not cat_dir.is_dir(): continue
-        cand = cat_dir / vp.stem / "preds.npy"
-        if cand.exists():
-            baseline_preds[vp.stem] = np.load(cand)[:30]
-            print(f"  {vp.name}: baseline from {cand.relative_to(STUDY_ROOT)}")
-            break
+parser = argparse.ArgumentParser()
+parser.add_argument("--alpha",        type=float, default=0.2,
+                    help="Suppression strength 0–1 (default 0.2)")
+parser.add_argument("--n_components", type=int,   default=1,
+                    help="PCA components per category (default 1)")
+parser.add_argument("--gore_only",    action="store_true",
+                    help="Apply gore direction only (skip porn)")
+args = parser.parse_args()
+
+print(f"alpha={args.alpha}  n_components={args.n_components}  "
+      f"gore_only={args.gore_only}")
+
+# ── Load saved activations ────────────────────────────────────────────────────
+
+def load_category(category, filenames):
+    acts_dir = OUT_DIR / f"acts_{category}"
+    X_list, y_list = [], []
+    missing = []
+    nan_files = []
+    for fname in filenames:
+        stem     = Path(fname).stem
+        act_path = acts_dir / f"{stem}_acts.npy"
+        y_path   = acts_dir / f"{stem}_y.npy"
+        if act_path.exists() and y_path.exists():
+            X_val = np.load(act_path)
+            y_val = np.load(y_path)
+            if np.isnan(y_val).any():
+                nan_files.append(y_path.name)
+            X_list.append(X_val)
+            y_list.append(y_val)
+        else:
+            missing.append(fname)
+    if nan_files:
+        print(f"  [{category}] WARNING: {len(nan_files)} target files contain NaNs:")
+        print(f"    {nan_files[:5]}{'...' if len(nan_files)>5 else ''}")
+        raise ValueError(
+            f"Target variable y contains NaNs in category {category}. "
+            f"Please delete the corrupted files and rerun collect_acts.py."
+        )
+    if missing:
+        print(f"  [{category}] WARNING: {len(missing)} files missing — "
+              f"run collect_acts.py first")
+        print(f"    {missing[:5]}{'...' if len(missing)>5 else ''}")
+    if not X_list:
+        raise FileNotFoundError(
+            f"No activations found for {category}. Run collect_acts.py first.")
+    X = np.concatenate(X_list)
+    y = np.concatenate(y_list)
+    print(f"  [{category}] loaded {X.shape[0]} clips, dim={X.shape[1]}, "
+          f"y∈[{y.min():.3f}, {y.max():.3f}]")
+    return X, y
+
+
+print("\nLoading activations from disk...")
+X_gore, y_gore = load_category("gore", CATEGORIES["gore"])
+X_porn, y_porn = load_category("porn", CATEGORIES["porn"])
+gc.collect()
+
+# ── Weighted PCA ──────────────────────────────────────────────────────────────
+
+def find_directions(X, y, n_components, label):
+    if np.isnan(y).any():
+        raise ValueError(f"[{label}] target variable y contains NaNs! SVD will fail.")
+    
+    y_min, y_max = y.min(), y.max()
+    y_range = y_max - y_min
+    if y_range < 1e-9:
+        print(f"  [{label}] y is constant (range < 1e-9), using uniform weights")
+        weights = np.ones_like(y) / len(y)
     else:
-        print(f"  [WARN] {vp.name}: no baseline preds found in tribe_study")
+        weights  = (y - y_min) / (y_range + 1e-9)
+        weights /= weights.sum()
+        
+    X_mean   = (X * weights[:, None]).sum(axis=0, keepdims=True)
+    X_c      = (X - X_mean) * np.sqrt(weights[:, None])
+    _, S, Vt = np.linalg.svd(X_c, full_matrices=False)
+    print(f"  [{label}] singular values: {S[:5].round(4)}")
+    print(f"  [{label}] explained variance ratio: "
+          f"{(S[:n_components+2]**2 / (S**2).sum()).round(3)}")
+    directions = Vt[:n_components].copy()
+    for i in range(n_components):
+        proj = X @ directions[i]
+        corr = float(np.corrcoef(proj, y)[0, 1])
+        if corr < 0:
+            directions[i] *= -1
+            print(f"  [{label}] flipped direction {i}")
+    return directions
 
-# ── Step 1: load model ────────────────────────────────────────────────────────
 
-print("\nLoading model...")
-model = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
+print("\nComputing directions...")
+gore_dirs = find_directions(X_gore, y_gore, args.n_components, "gore")
+porn_dirs = find_directions(X_porn, y_porn, args.n_components, "porn")
 
-vjepa2     = model.data.video_feature.image.model.model
-N_LAYERS   = len(vjepa2.encoder.layer)
-TARGET_IDX = int(N_LAYERS * 0.75)
-print(f"V-JEPA2: {N_LAYERS} layers, target={TARGET_IDX}")
+np.save(OUT_DIR / "gore_directions.npy", gore_dirs)
+np.save(OUT_DIR / "porn_directions.npy", porn_dirs)
+print(f"Directions saved → {OUT_DIR}")
 
-# ── Step 2: wipe exca activation cache entirely ───────────────────────────────
-# exca stores (20, 1408, n_clips) float32 memmap arrays keyed by video path.
-# We delete the uid_folder (config-hash-specific subdirectory) so exca is
-# forced to recompute all entries from scratch using the current model weights.
+# Free activation arrays before loading the model
+del X_gore, y_gore, X_porn, y_porn
+gc.collect()
 
-infra      = model.data.video_feature.infra
-cache_dict = infra.cache_dict
-uid_folder = Path(str(infra.uid_folder))
+# ── Offline selectivity printout ──────────────────────────────────────────────
 
-# clear in-memory cache
-n_mem = len(list(cache_dict.keys()))
-for k in list(cache_dict.keys()):
-    del cache_dict[k]
-print(f"\nCleared {n_mem} in-memory cache entries")
+gore_mask = np.load(GORE_MASK_FILE)
+porn_mask = np.load(PORN_MASK_FILE)
 
-# clear disk cache
-if uid_folder.exists():
-    shutil.rmtree(uid_folder)
-    print(f"Deleted disk cache: {uid_folder}")
-else:
-    # fallback: scan for any .data files matching val video names
-    val_names  = {vp.name for vp in val_videos}
-    n_disk = 0
-    for info_file in CACHE_BASE.rglob("*info.jsonl"):
-        try:
-            if any(n in info_file.read_text() for n in val_names):
-                shutil.rmtree(info_file.parent)
-                n_disk += 1
-        except Exception:
-            pass
-    print(f"Fallback disk clear: removed {n_disk} cache dirs")
+# Save masks to OUT_DIR for validation.py
+np.save(OUT_DIR / "gore_mask.npy", gore_mask)
+np.save(OUT_DIR / "porn_mask.npy", porn_mask)
+print(f"Masks saved → {OUT_DIR}")
 
-# ── Step 3: load abliterated weights and VERIFY they changed ─────────────────
+print(f"\nGore mask: {gore_mask.sum()} vertices")
+print(f"Porn mask: {porn_mask.sum()} vertices")
 
-abl_path = OUT_DIR / "vjepa2_abliterated.pt"
-if not abl_path.exists():
-    raise FileNotFoundError(
-        f"{abl_path} not found. Re-run: python surgery.py --alpha 0.5 --n_components 1"
-    )
-
-# snapshot a weight we know was surgically modified
-w_before = vjepa2.encoder.layer[TARGET_IDX].attention.value.weight.data.clone()
-
-print(f"\nLoading abliterated weights from {abl_path} ...")
-abl_state = torch.load(abl_path, map_location="cpu")
-missing, unexpected = vjepa2.load_state_dict(abl_state, strict=False)
-
-if missing:
-    print(f"  WARNING: {len(missing)} missing keys  (sample: {missing[:3]})")
-if unexpected:
-    print(f"  WARNING: {len(unexpected)} unexpected keys (sample: {unexpected[:3]})")
-
-w_after = vjepa2.encoder.layer[TARGET_IDX].attention.value.weight.data
-diff    = (w_before - w_after).abs().max().item()
-print(f"  Max weight delta at encoder.layer[{TARGET_IDX}].attention.value: {diff:.8f}")
-
-if diff < 1e-8:
-    raise RuntimeError(
-        "FATAL: abliterated weights did NOT load — weight tensors are identical.\n"
-        "Likely cause: state dict keys do not match.\n"
-        "Fix: re-run surgery.py which saves from the same vjepa2_module object.\n"
-        f"State dict path: {abl_path}\n"
-        f"Missing keys: {missing[:5]}"
-    )
-
-print(f"  Weights successfully modified (delta={diff:.6f})")
-
-# ── Step 4: run inference — exca recomputes from scratch ─────────────────────
-# Cache is empty; exca calls _HuggingFace.forward() which uses the current
-# (abliterated) weights. Results are cached and then fed to the regression head.
-
-results = []
-
-for vp in val_videos:
-    stem = vp.stem
-    if stem not in baseline_preds:
-        print(f"\n[SKIP] no baseline for {vp.name}")
+print(f"\n{'Category':12s}  {'gore_mask':>10}  {'porn_mask':>10}")
+print("-" * 40)
+for cat in ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]:
+    paths = sorted((STUDY_ROOT / cat).glob("*/preds.npy"))
+    if not paths:
         continue
+    cat_mean = np.stack([np.load(p)[:30].mean(axis=0) for p in paths]).mean(axis=0)
+    gm = float(cat_mean[gore_mask].mean())
+    pm = float(cat_mean[porn_mask].mean())
+    print(f"  {cat:12s}  {gm:10.4f}  {pm:10.4f}")
 
-    print(f"\n{'='*55}\nVideo: {vp.name}")
+# ── Load model for surgery ────────────────────────────────────────────────────
 
-    preds_base = baseline_preds[stem]
-    df         = make_video_only_df(vp)
-    print(f"  Duration: {df['duration'].values[0]:.3f}s")
-    print("  Running abliterated inference...")
+print("\nLoading model for weight surgery...")
+model          = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
+vjepa2_module  = model.data.video_feature.image.model.model
+encoder_blocks = vjepa2_module.encoder.layer
+N_LAYERS       = len(encoder_blocks)
+TARGET_IDX     = int(N_LAYERS * 0.75)
+print(f"Target: encoder.layer[{TARGET_IDX}] / {N_LAYERS}")
 
-    preds_abl, _ = model.predict(events=df)
-    preds_abl = preds_abl[:30]
+# ── Weight surgery ────────────────────────────────────────────────────────────
 
-    print()
-    for mask, mname in [(gore_mask,"gore_mask"),(porn_mask,"porn_mask")]:
-        base_val = float(preds_base[:,mask].mean())
-        abl_val  = float(preds_abl[:,mask].mean())
-        diff_val = abl_val - base_val
-        pct      = 100 * diff_val / (abs(base_val) + 1e-9)
-        tag      = "✓ suppressed" if diff_val < -0.005 else \
-                   ("✗ no change"  if abs(diff_val) < 0.005 else "↑ increased")
-        print(f"  {mname:12s}  base={base_val:.4f}  abl={abl_val:.4f}  "
-              f"Δ={diff_val:+.4f} ({pct:+.1f}%)  {tag}")
+def apply_weight_surgery(gore_dirs, porn_dirs, alpha, gore_only):
+    if gore_only:
+        print("  Gore-only mode — skipping porn directions")
+        all_dirs = gore_dirs
+    else:
+        all_dirs = np.concatenate([gore_dirs, porn_dirs], axis=0)
 
-    bg = float(preds_base.mean())
-    ag = float(preds_abl.mean())
-    print(f"  {'whole_brain':12s}  base={bg:.4f}  abl={ag:.4f}  "
-          f"Δ={ag-bg:+.4f} ({100*(ag-bg)/(abs(bg)+1e-9):+.1f}%)")
+    dirs_t = torch.tensor(all_dirs, dtype=torch.float32).to(DEVICE)
 
-    torch.cuda.empty_cache(); gc.collect()
-    results.append({"video":vp.name,"preds_base":preds_base,"preds_abl":preds_abl})
+    # Gram-Schmidt orthogonalization
+    ortho = []
+    for d in dirs_t:
+        for q in ortho:
+            d = d - (d @ q) * q
+        if d.norm() > 1e-6:
+            ortho.append(d / d.norm())
 
-# ── Save ──────────────────────────────────────────────────────────────────────
+    if not ortho:
+        raise ValueError("No valid directions after Gram-Schmidt")
 
-print("\n" + "="*55 + "\nSaving results...")
-for r in results:
-    s = Path(r["video"]).stem
-    np.save(OUT_DIR / f"val_{s}_base.npy", r["preds_base"])
-    np.save(OUT_DIR / f"val_{s}_abl.npy",  r["preds_abl"])
-    print(f"  Saved val_{s}_base.npy + val_{s}_abl.npy")
+    ortho = torch.stack(ortho)
+    print(f"  Applying {len(ortho)} orthogonal directions with alpha={alpha}")
 
-print("\nDone.")
+    block = encoder_blocks[TARGET_IDX]
+
+    for layer_name in ["attention.value", "attention.proj"]:
+        mod = block
+        for part in layer_name.split("."):
+            mod = getattr(mod, part)
+        W = mod.weight.data.clone()
+        print(f"  Surgery on block[{TARGET_IDX}].{layer_name}  {tuple(W.shape)}")
+        for q in ortho:
+            W -= alpha * (W @ q).unsqueeze(-1) * q
+        mod.weight.data = W
+
+    out_path = OUT_DIR / f"vjepa2_abliterated_a{alpha}_c{len(ortho)}.pt"
+    torch.save(vjepa2_module.state_dict(), out_path)
+    print(f"  Saved → {out_path}")
+    print(f"  File size: {out_path.stat().st_size / 1e6:.1f} MB")
+    return out_path
+
+
+out_path = apply_weight_surgery(gore_dirs, porn_dirs, args.alpha, args.gore_only)
+
+# Also save a copy with the canonical name validation.py expects
+import shutil
+canonical = OUT_DIR / "vjepa2_abliterated.pt"
+shutil.copy(out_path, canonical)
+print(f"  Copied to canonical path: {canonical}")
+
+print("\nSurgery complete.")
+print(f"Next step: run tribe_validation.py")
