@@ -297,8 +297,9 @@ def evaluate_layer_suppression(directions, validation_video):
         infra = model.data.video_feature.infra
         for k in list(infra.cache_dict.keys()):
             del infra.cache_dict[k]
-        if Path(str(infra.uid_folder)).exists():
-            shutil.rmtree(Path(str(infra.uid_folder)))
+        uid_folder = infra.uid_folder()
+        if uid_folder is not None and uid_folder.exists():
+            shutil.rmtree(uid_folder)
             
         # Apply surgery to all layers in the case
         for L in case:
