@@ -245,74 +245,151 @@ def compute_directions_for_layers(activations):
 
 # ── Step 3: Run Validation & Evaluate Suppression Delta ───────────────────────
 
+def _nuke_cache_for_video(video_path: Path):
+    """
+    Aggressively clear every exca cache entry that could correspond to this
+    video.  exca uses a content-addressed uid derived from the file path
+    (sometimes absolute, sometimes relative) and stores data under
+    CACHE_DIR/<uid>/.  Because the uid is config-hash-based and all our
+    model variants share the same config, all variants share the same on-disk
+    cache.  We can't rely on uid_folder() either — it often returns None for
+    the image infra that actually caches VJEPA2 activations.
+
+    The safest approach: scan the entire CACHE_DIR for any folder whose
+    info.jsonl references the video filename, and delete it.  Then do a
+    second pass removing any .data memmap file whose parent folder contains
+    matching entries.
+    """
+    video_name = video_path.name
+    video_stem = video_path.stem
+    deleted = 0
+    if not CACHE_DIR.exists():
+        return deleted
+    # Walk all subdirectories one level deep (exca layout: cache/<uid>/...)
+    for entry in CACHE_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        # Check info.jsonl
+        info_file = entry / "info.jsonl"
+        matched = False
+        if info_file.exists():
+            try:
+                text = info_file.read_text()
+                if video_name in text or video_stem in text:
+                    matched = True
+            except OSError:
+                pass
+        # Also check any nested info.jsonl one level deeper
+        if not matched:
+            for sub in entry.iterdir():
+                if sub.is_dir():
+                    sub_info = sub / "info.jsonl"
+                    if sub_info.exists():
+                        try:
+                            text = sub_info.read_text()
+                            if video_name in text or video_stem in text:
+                                matched = True
+                                break
+                        except OSError:
+                            pass
+        if matched:
+            shutil.rmtree(entry)
+            deleted += 1
+    return deleted
+
+
+def _fingerprint_weights(encoder_blocks, layer_indices):
+    """Return a small float that changes if any target weight matrix changes."""
+    total = 0.0
+    for L in layer_indices:
+        block = encoder_blocks[L]
+        for layer_name in ["attention.value", "attention.proj"]:
+            mod = block
+            for p in layer_name.split("."):
+                mod = getattr(mod, p)
+            total += float(mod.weight.data.sum())
+    return total
+
+
 def evaluate_layer_suppression(directions, validation_video):
     print(f"\n=== Step 3: Running Validation Inference on {validation_video.name} ===")
-    
+
     gore_mask = np.load(GORE_MASK_FILE)
     porn_mask = np.load(PORN_MASK_FILE)
-    
+
     # Load baseline predictions for the video
     stem = validation_video.stem
     base_preds_path = STUDY_ROOT / "gore" / stem / "preds.npy"
     if not base_preds_path.exists():
-        # Fallback to search in all folders
         for cat_dir in STUDY_ROOT.iterdir():
-            if not cat_dir.is_dir(): continue
+            if not cat_dir.is_dir():
+                continue
             cand = cat_dir / stem / "preds.npy"
             if cand.exists():
                 base_preds_path = cand
                 break
-                
+
     if not base_preds_path.exists():
         raise FileNotFoundError(f"Baseline predictions for {validation_video.name} not found in tribe_study.")
-        
+
     preds_base = np.load(base_preds_path)[:30]
     base_gore_mean = float(preds_base[:, gore_mask].mean())
     base_porn_mean = float(preds_base[:, porn_mask].mean())
     base_wb_mean   = float(preds_base.mean())
-    
+
     print(f"Baseline Predictions on {validation_video.name}:")
     print(f"  Gore Mask Mean: {base_gore_mean:.4f}")
     print(f"  Porn Mask Mean: {base_porn_mean:.4f}")
     print(f"  Whole Brain Mean: {base_wb_mean:.4f}")
-    
+
     comparison_results = []
-    
-    # We test each layer individually, and also a combination of top layers
+
+    # Test each layer individually and a few multi-layer combinations
     test_cases = [(L,) for L in CANDIDATE_LAYERS] + [
-        (28, 30, 32), # Triple block
-        (30, 32),     # Double block
+        (28, 30, 32),
+        (30, 32),
     ]
-    
+
     for case in test_cases:
         case_name = "+".join(map(str, case))
         print(f"\nEvaluating abliteration on Layer(s): {case_name}")
-        
-        # Load fresh model
+
+        # ── 1. Nuke the on-disk cache for this video BEFORE loading the model.
+        #    This prevents the freshly-loaded model from immediately reading a
+        #    stale cache entry that was written by the previous iteration.
+        n_deleted = _nuke_cache_for_video(validation_video)
+        print(f"  [CACHE] Deleted {n_deleted} cache dirs for {validation_video.name}")
+
+        # ── 2. Load a fresh model instance.
         model = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
-        vjepa2_module = model.data.video_feature.image.model.model
+        vjepa2_module  = model.data.video_feature.image.model.model
         encoder_blocks = vjepa2_module.encoder.layer
-        
-        # Clear exca caches for both video and image extractors to force forward pass
-        video_infra = model.data.video_feature.infra
-        image_infra = model.data.video_feature.image.infra
-        for infra in [video_infra, image_infra]:
-            if infra.folder is None:
-                continue
-            for k in list(infra.cache_dict.keys()):
-                del infra.cache_dict[k]
-            uid_folder = infra.uid_folder()
-            if uid_folder is not None and uid_folder.exists():
-                shutil.rmtree(uid_folder)
-                uid_folder.mkdir(parents=True, exist_ok=True)
-            
-        # Apply surgery to all layers in the case
+
+        # ── 3. Also clear the in-memory cache_dict on every infra we can reach,
+        #    just in case a previous iteration populated it.
+        for attr_path in [
+            "data.video_feature.infra",
+            "data.video_feature.image.infra",
+        ]:
+            try:
+                infra = model
+                for part in attr_path.split("."):
+                    infra = getattr(infra, part)
+                for k in list(infra.cache_dict.keys()):
+                    del infra.cache_dict[k]
+            except AttributeError:
+                pass
+
+        # ── 4. Snapshot weight fingerprint before surgery (sanity check).
+        fp_before = _fingerprint_weights(encoder_blocks, case)
+
+        # ── 5. Apply surgery.
+        alpha = 0.2
         for L in case:
             dir_g = directions[L]["gore"]
             dir_p = directions[L]["porn"]
             dirs_t = torch.tensor(np.stack([dir_g, dir_p]), dtype=torch.float32).to(DEVICE)
-            
-            # Gram-Schmidt
+
             ortho = []
             for d in dirs_t:
                 for q in ortho:
@@ -320,11 +397,8 @@ def evaluate_layer_suppression(directions, validation_video):
                 if d.norm() > 1e-6:
                     ortho.append(d / d.norm())
             ortho = torch.stack(ortho)
-            
-            # Target block
+
             block = encoder_blocks[L]
-            alpha = 0.2
-            
             for layer_name in ["attention.value", "attention.proj"]:
                 mod = block
                 for p in layer_name.split("."):
@@ -333,29 +407,39 @@ def evaluate_layer_suppression(directions, validation_video):
                 for q in ortho:
                     W -= alpha * (W @ q).unsqueeze(-1) * q
                 mod.weight.data = W
-                
-        # Run inference
+
+        # ── 6. Confirm weights actually changed.
+        fp_after = _fingerprint_weights(encoder_blocks, case)
+        weight_delta = abs(fp_after - fp_before)
+        if weight_delta < 1e-6:
+            print(f"  [WARN] Weight fingerprint unchanged (Δ={weight_delta:.2e}) — surgery may not have applied!")
+        else:
+            print(f"  [OK] Weights modified (fingerprint Δ={weight_delta:.4f})")
+
+        # ── 7. Run inference.  Because the cache was nuked in step 1 and the
+        #    in-memory dict was cleared in step 3, exca must re-run the forward
+        #    pass through the now-modified weights.
         df = make_video_only_df(validation_video)
         preds_abl, _ = model.predict(events=df)
         preds_abl = preds_abl[:30]
-        
+
         abl_gore_mean = float(preds_abl[:, gore_mask].mean())
         abl_porn_mean = float(preds_abl[:, porn_mask].mean())
         abl_wb_mean   = float(preds_abl.mean())
-        
+
         gore_diff = abl_gore_mean - base_gore_mean
         gore_pct  = 100 * gore_diff / (abs(base_gore_mean) + 1e-9)
-        
+
         porn_diff = abl_porn_mean - base_porn_mean
         porn_pct  = 100 * porn_diff / (abs(base_porn_mean) + 1e-9)
-        
+
         wb_diff = abl_wb_mean - base_wb_mean
         wb_pct  = 100 * wb_diff / (abs(base_wb_mean) + 1e-9)
-        
+
         print(f"  Gore Mask: {base_gore_mean:.4f} -> {abl_gore_mean:.4f} (Δ={gore_diff:+.4f}, {gore_pct:+.1f}%)")
         print(f"  Porn Mask: {base_porn_mean:.4f} -> {abl_porn_mean:.4f} (Δ={porn_diff:+.4f}, {porn_pct:+.1f}%)")
         print(f"  Whole Brain: {base_wb_mean:.4f} -> {abl_wb_mean:.4f} (Δ={wb_diff:+.4f}, {wb_pct:+.1f}%)")
-        
+
         comparison_results.append({
             "layers": case_name,
             "gore_delta": gore_diff,
@@ -363,13 +447,13 @@ def evaluate_layer_suppression(directions, validation_video):
             "porn_delta": porn_diff,
             "porn_pct": porn_pct,
             "wb_delta": wb_diff,
-            "wb_pct": wb_pct
+            "wb_pct": wb_pct,
         })
-        
+
         del model, vjepa2_module
         torch.cuda.empty_cache()
         gc.collect()
-        
+
     return comparison_results
 
 # ── Main ──────────────────────────────────────────────────────────────────────
