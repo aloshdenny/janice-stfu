@@ -15,7 +15,19 @@ from torchvision import transforms
 from torchvision.transforms.functional import resize
 import gc
 import time
+import argparse
 from tribev2.demo_utils import TribeModel
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument("--alpha",        type=float, default=0.5,
+                    help="Suppression strength 0–1 (default 0.5)")
+parser.add_argument("--n_components", type=int,   default=3,
+                    help="PCA components per category (default 3)")
+parser.add_argument("--gore_only",    action="store_true",
+                    help="Apply gore direction only (skip porn)")
+args = parser.parse_args()
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -227,8 +239,11 @@ def collect_for_category(category, filenames, out_dir):
 print("\nCollecting gore activations (strong signal)...")
 X_gore, y_gore = collect_for_category("gore", CATEGORIES["gore"], OUT_DIR)
 
-print("\nCollecting porn activations (weak signal — body/skin proxy)...")
-X_porn, y_porn = collect_for_category("porn", CATEGORIES["porn"], OUT_DIR)
+X_porn, y_porn = None, None
+if not args.gore_only:
+    print("\nCollecting porn activations (weak signal — body/skin proxy)...")
+    X_porn, y_porn = collect_for_category("porn", CATEGORIES["porn"], OUT_DIR)
+
 
 torch.cuda.empty_cache()
 gc.collect()
@@ -269,11 +284,15 @@ def find_directions(X, y, n_components=1, label=""):  # reduce to 1 component
 
 
 print("\nComputing directions...")
-gore_dirs = find_directions(X_gore, y_gore, n_components=3, label="gore")
-porn_dirs = find_directions(X_porn, y_porn, n_components=3, label="porn")
+gore_dirs = find_directions(X_gore, y_gore, n_components=args.n_components, label="gore")
+if args.gore_only:
+    porn_dirs = np.zeros((0, X_gore.shape[1]))
+else:
+    porn_dirs = find_directions(X_porn, y_porn, n_components=args.n_components, label="porn")
 
 np.save(OUT_DIR / "gore_directions.npy", gore_dirs)
-np.save(OUT_DIR / "porn_directions.npy", porn_dirs)
+if not args.gore_only:
+    np.save(OUT_DIR / "porn_directions.npy", porn_dirs)
 np.save(OUT_DIR / "gore_mask.npy", gore_mask)
 np.save(OUT_DIR / "porn_mask.npy", porn_mask)
 print(f"Saved → {OUT_DIR}")
@@ -316,8 +335,12 @@ def make_gs_hook(directions_np):
 
 # ── Weight surgery (permanent) ────────────────────────────────────────────────
 
-def apply_weight_surgery():
-    all_dirs = np.concatenate([gore_dirs, porn_dirs], axis=0)
+def apply_weight_surgery(alpha, gore_only):
+    if gore_only:
+        print("  Gore-only mode — skipping porn directions")
+        all_dirs = gore_dirs
+    else:
+        all_dirs = np.concatenate([gore_dirs, porn_dirs], axis=0)
     dirs_t   = torch.tensor(all_dirs, dtype=torch.float32).to(DEVICE)
 
     ortho = []
@@ -338,13 +361,18 @@ def apply_weight_surgery():
         W = mod.weight.data
         print(f"  Surgery on block[{TARGET_IDX}].{layer_name}  {W.shape}")
         for q in ortho:
-            alpha = 0.5  # suppression strength
             W -= alpha * (W @ q).unsqueeze(-1) * q
         mod.weight.data = W
 
-    torch.save(vjepa2_module.state_dict(), OUT_DIR / "vjepa2_abliterated.pt")
-    print(f"  Saved → {OUT_DIR / 'vjepa2_abliterated.pt'}")
-    print(f"  File size: {(OUT_DIR / 'vjepa2_abliterated.pt').stat().st_size / 1e6:.1f} MB")
+    out_name = f"vjepa2_abliterated_a{alpha}_c{len(ortho)}.pt"
+    torch.save(vjepa2_module.state_dict(), OUT_DIR / out_name)
+    print(f"  Saved → {OUT_DIR / out_name}")
+    print(f"  File size: {(OUT_DIR / out_name).stat().st_size / 1e6:.1f} MB")
+    
+    # Copy to canonical filename expected by evaluation scripts
+    canonical = OUT_DIR / "vjepa2_abliterated.pt"
+    torch.save(vjepa2_module.state_dict(), canonical)
+    print(f"  Copied to canonical path: {canonical}")
 
 # ── Load model for surgery ────────────────────────────────────────────────────
 print("\nLoading model for weight surgery...")
@@ -352,4 +380,4 @@ model = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
 vjepa2_module  = model.data.video_feature.image.model.model
 encoder_blocks = vjepa2_module.encoder.layer
 
-apply_weight_surgery()
+apply_weight_surgery(alpha=args.alpha, gore_only=args.gore_only)
