@@ -517,8 +517,15 @@ def evaluate_layer_suppression(directions, validation_video):
                 print(f"  [PATCH] Layer {L} -> cache_idx={cache_idx} patched in {df_path.name}")
 
             if patched_any:
-                # Write modified array back over the memmap file
-                np.save(str(df_path), arr)
+                # Write back as raw memmap — NOT np.save.
+                # exca reads .data files via np.memmap(path, dtype, 'r', shape=...)
+                # which expects raw binary with no .npy header.  np.save would
+                # prepend a magic header and corrupt the file, causing exca to
+                # fall back to re-running the encoder and returning baseline preds.
+                mm = np.memmap(str(df_path), dtype=arr.dtype, mode="r+", shape=arr.shape)
+                mm[:] = arr
+                mm.flush()
+                del mm
 
         if not patched_any:
             print(f"  [WARN] No .data files were patched — results will equal baseline")
@@ -568,7 +575,10 @@ def evaluate_layer_suppression(directions, validation_video):
         # Restore baseline .data files for next iteration
         for df_path, baseline_arr in baseline_arrays.items():
             try:
-                np.save(str(df_path), baseline_arr)
+                mm = np.memmap(str(df_path), dtype=baseline_arr.dtype, mode="r+", shape=baseline_arr.shape)
+                mm[:] = baseline_arr
+                mm.flush()
+                del mm
             except Exception as e:
                 print(f"  [WARN] Could not restore {df_path.name}: {e}")
 
