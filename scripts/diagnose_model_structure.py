@@ -74,7 +74,7 @@ else:
             d = d - (d @ q) * q
         if d.norm() > 1e-6:
             ortho.append(d / d.norm())
-    ortho = torch.stack(ortho)
+    ortho = torch.stack(ortho).to(block.attention.value.weight.device)
     print(f"Number of orthogonal directions: {len(ortho)}")
 
     # Simulating surgery with different alphas
