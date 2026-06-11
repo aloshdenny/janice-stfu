@@ -58,7 +58,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DATA_DIR   = Path("./data_256")
+DATA_DIR   = Path("./data")
 STUDY_ROOT = Path("./tribe_study")
 CACHE_DIR  = Path("./cache")
 ANALYSIS_DIR    = Path("./analysis")
