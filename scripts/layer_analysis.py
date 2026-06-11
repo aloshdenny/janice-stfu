@@ -1,5 +1,5 @@
 """
-analysis.py
+layer_analysis.py
 
 SCIENTIFIC SCOPE
 ━━━━━━━━━━━━━━━━
@@ -1029,3 +1029,18 @@ for r in ["Nucleus accumbens  ← PRIMARY porn-reward target (subcortical)",
 print(f"\nAll outputs → {ANALYSIS_DIR.resolve()}")
 for f in sorted(ANALYSIS_DIR.glob("roi*.png")):
     print(f"  {f.name}")
+
+# ── Save per-category mean |r| profiles across all ROIs ───────────────────
+# shape per category: (N_LAYERS,) — used by abliteration.py for auto layer selection
+
+MASK_DIR = STUDY_ROOT / "masks"
+MASK_DIR.mkdir(exist_ok=True)
+
+profile_data = {}
+for cat in cats_with_data:
+    # Mean absolute Pearson r across all retained ROIs, per layer
+    profiles = np.stack([np.abs(layer_roi_r[cat][roi["key"]]) for roi in ROIS])
+    profile_data[cat] = profiles.mean(axis=0)   # (N_LAYERS,)
+
+np.savez(MASK_DIR / "layer_profiles.npz", **profile_data)
+print(f"Layer profiles saved → {MASK_DIR / 'layer_profiles.npz'}")

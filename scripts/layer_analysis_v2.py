@@ -1,5 +1,5 @@
 """
-analysis.py  (v2 — expanded ROIs + abliteration-purpose categories)
+layer_analysis.py  (v2 — expanded ROIs + abliteration-purpose categories)
 
 SCIENTIFIC SCOPE
 ━━━━━━━━━━━━━━━━

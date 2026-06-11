@@ -1,3 +1,7 @@
+"""
+strict_analysis.py
+"""
+
 import os
 import warnings
 import logging
@@ -173,3 +177,55 @@ MASK_DIR.mkdir(exist_ok=True)
 for name, mask in new_masks.items():
     np.save(MASK_DIR / f"{name}_strict.npy", mask)
 print(f"\nStrict masks saved → {MASK_DIR}")
+
+# ── Auto-select best masks and emit config ─────────────────────────────────
+
+import json
+
+def score_mask(target_cat, mask, means, categories):
+    """
+    Composite score:
+      1. selectivity = target_mean - mean_of_others  (higher is better)
+      2. food_penalty = max(0, food_mean - target_mean)  (zero is ideal)
+      3. n_verts >= 100 sanity gate
+    Returns None if mask fails the gate.
+    """
+    if mask.sum() < 100:
+        return None
+    target_val = float(means[target_cat][mask].mean())
+    other_cats = [c for c in categories if c != target_cat]
+    other_val  = float(np.stack([means[c][mask] for c in other_cats]).mean())
+    food_val   = float(means["food"][mask].mean())
+    selectivity   = target_val - other_val
+    food_penalty  = max(0.0, food_val - target_val)
+    return selectivity - 2.0 * food_penalty   # food leak weighted 2x
+
+MASK_CANDIDATES = {
+    "porn": ["porn_specific", "porn_tight", "porn_allneutral", "porn_no_food"],
+    "gore": ["gore_specific", "gore_tight", "gore_allneutral", "gore_no_food",
+             "gore_strict_bicontrast", "gore_strict_multivariate_all"],
+}
+
+auto_selected = {}
+for target_cat, candidates in MASK_CANDIDATES.items():
+    best_name, best_score = None, -np.inf
+    for name in candidates:
+        mask = new_masks.get(name)
+        if mask is None:
+            continue
+        s = score_mask(target_cat, mask, means, CATEGORIES)
+        if s is not None and s > best_score:
+            best_score, best_name = s, name
+    if best_name:
+        auto_selected[target_cat] = {
+            "mask_file": str(MASK_DIR / f"{best_name}_strict.npy"),
+            "mask_name": best_name,
+            "score":     round(float(best_score), 6),
+            "n_verts":   int(new_masks[best_name].sum()),
+        }
+        print(f"\nAUTO-SELECTED [{target_cat}]: {best_name}  score={best_score:.4f}  n={new_masks[best_name].sum()}")
+
+config_path = MASK_DIR / "abliteration_config.json"
+with open(config_path, "w") as f:
+    json.dump(auto_selected, f, indent=2)
+print(f"\nConfig written → {config_path}")
