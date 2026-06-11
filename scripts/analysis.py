@@ -398,10 +398,10 @@ def decode_clip(path, start, dur, n_frames, w, h):
         fb  = h * w * 3
         raw += raw[-(len(raw)//fb)*fb or -fb:][-fb:] * \
                ((need - len(raw) + fb - 1) // fb)
-    return (np.frombuffer(raw[:need], dtype=np.uint8)
-              .reshape(n_frames, h, w, 3)
-              .astype(np.float32) / 255.0
-              .transpose(0, 3, 1, 2))
+    frames = (np.frombuffer(raw[:need], dtype=np.uint8)
+               .reshape(n_frames, h, w, 3)
+               .astype(np.float32) / 255.0)
+    return frames.transpose(0, 3, 1, 2)   # (T, 3, H, W)
 
 def iter_clips(path):
     fps, total_dur, w, h = probe_video(path)
