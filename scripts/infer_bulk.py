@@ -59,7 +59,7 @@ CHUNK = 10
 
 # ── Video categories ──────────────────────────────────────────────────────────
 
-DATA_DIR = Path("./data")
+DATA_DIR = Path("./data_256")
 
 VIDEOS = {
     "porn": "porn*.mp4",

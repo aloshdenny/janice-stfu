@@ -36,7 +36,7 @@ from tribev2.demo_utils import TribeModel
 STUDY_ROOT    = Path("./tribe_study")
 MASK_DIR      = STUDY_ROOT / "masks"
 CACHE_DIR     = Path("./cache")
-DATA_DIR      = Path("./data")
+DATA_DIR      = Path("./data_256")
 OUT_DIR       = Path("./abliterated")
 OUT_DIR.mkdir(exist_ok=True)
 

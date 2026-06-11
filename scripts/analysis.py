@@ -1,32 +1,44 @@
 """
-diagnose_layers_by_region.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+analysis.py
 
 SCIENTIFIC SCOPE
 ━━━━━━━━━━━━━━━━
 TRIBE v2 predicts on the fsaverage5 CORTICAL SURFACE only (20,484 vertices).
-Every ROI below is grounded in the Destrieux (aparc.a2009s) atlas, which is
-the atlas shipped with FreeSurfer and available via nilearn with no extra
-install. All label strings are the EXACT aparc.a2009s names from the
-official FreeSurfer Destrieux atlas table (surfer.nmr.mgh.harvard.edu/
-fswiki/DestrieuxAtlasChanges).  No fuzzy substring guessing — every entry
-is an exact match against the atlas.
+Every ROI below is grounded in the Destrieux (aparc.a2009s) atlas.
+All label strings are EXACT aparc.a2009s names verified against the official
+FreeSurfer wiki table at:
+  surfer.nmr.mgh.harvard.edu/fswiki/DestrieuxAtlasChanges
+
+The full atlas has 75 labels per hemisphere (74 cortical + Medial_wall).
+This file covers 31 ROIs total (5 lobes).
+
+NEW ROIs (added beyond original 22):
+  OFA      — Occipital Face Area (lateral occipital gyrus)
+  TP       — Temporal Pole  (person familiarity / semantic memory)
+  ATL      — Anterior Temporal Lobe face area  (person identity)
+  PREC     — Precuneus  (mental imagery, autobiographical memory)
+  TPJ      — Temporo-Parietal Junction  (social cognition, mentalising)
+  LO       — Lateral Occipital Cortex  (object recognition)
+  PT       — Planum Temporale  (emotional prosody, audiovisual)
+  FPC      — Frontal Pole / frontopolar PFC  (craving suppression)
+  MPC      — Medial Parietal Cortex  (autobiographical retrieval)
 
 NOT MAPPABLE (outside fsaverage5 cortical surface, dropped without error):
-  Brainstem (medulla, pons, midbrain, all nuclei), cerebellum, thalamus,
-  hypothalamus, hippocampus, amygdala, basal ganglia, basal forebrain,
-  claustrum, white-matter tracts, ventricular system, spinal cord.
+  Nucleus accumbens, caudate, putamen (striatum) — the primary porn-reward locus
+  is subcortical.  Same applies to: VTA, amygdala, hippocampus, thalamus,
+  hypothalamus, brainstem, cerebellum, all white-matter tracts.
 
-MAPPABLE REGIONS (22 ROIs, 5 lobes)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Occipital   V1, V2/V3, V4, MT/V5
-Temporal    A1/Heschl, STG, STS, FFA, PPA, MTG, ITG
-Parietal    S1, SPL, IPL/SMG+AG, PCC/RSC
-Frontal     M1, PMC/SMA, DLPFC, IFG/Broca, OFC, mPFC, ACC
-Insula      Insula
+ABLITERATION USE-CASE NOTES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Goal A — Porn addiction:  OFC + vmPFC/MPFC + ACC + FPC as cortical proxies
+  for the subcortical NAcc reward circuit.  Key contrast: porn vs. neutral.
 
-Sources: Destrieux et al. 2010; Glasser et al. 2016 (HCP-MMP1);
-         arxiv:2605.13904 (feature viz on TRIBE v2)
+Goal B — Food addiction:  OFC + INS + ACC as cortical nodes for
+  palatability-driven overconsumption.  Key contrast: food vs. nature.
+
+Sources: Destrieux et al. 2010; Haxby et al. 2000; Kanwisher 1997;
+         Voon et al. 2014; Stoeckel et al. 2008 (food cue OFC/INS);
+         arxiv:2605.13904 (TRIBE v2)
 """
 
 import warnings, logging
@@ -41,22 +53,24 @@ from tribev2.demo_utils import TribeModel
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import gc, subprocess, json
+import gc, subprocess, json, os
+from concurrent.futures import ProcessPoolExecutor
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DATA_DIR   = Path("./data")
+DATA_DIR   = Path("./data_256")
 STUDY_ROOT = Path("./tribe_study")
 CACHE_DIR  = Path("./cache")
-OUT_DIR    = Path("./diagnosis")
-OUT_DIR.mkdir(exist_ok=True)
+ANALYSIS_DIR    = Path("./analysis")
+ANALYSIS_DIR.mkdir(exist_ok=True)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CATEGORIES       = ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]
-N_VIDEOS_PER_CAT = 16
-CLIP_FRAMES      = 16
-CLIP_DURATION    = 4.0
+CATEGORIES        = ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]
+CLIP_FRAMES       = 16
+CLIP_DURATION     = 4.0
+INFERENCE_BATCH   = 3          # clips processed per forward pass
+N_PLOT_WORKERS    = os.cpu_count() or 1   # parallel plot processes
 
 from torchvision import transforms
 normalize_fn = transforms.Normalize(mean=[0.485, 0.456, 0.406],
@@ -101,6 +115,24 @@ ROIS = [
          source="Maunsell & Van Essen 1983",
          destrieux_exact=["G_oc-temp_lat-fusifor",
                            "S_oc-temp_lat"]),
+
+    # NEW: Occipital Face Area — lateral occipital / inferior occipital gyrus
+    # First cortical node to encode face structural configuration before FFA.
+    dict(key="OFA", label="OFA",       lobe="occipital",
+         wiki="Occipital Face Area — inferior/lateral occipital cortex",
+         function="Early structural encoding of faces; feeds FFA",
+         source="Rossion 2014; Pitcher et al. 2011",
+         destrieux_exact=["G_and_S_occipital_inf",
+                           "S_oc_middle_and_Lunatus",
+                           "Pole_occipital"]),
+
+    # NEW: Lateral Occipital Cortex (LO) — object recognition "what" pathway
+    dict(key="LO",  label="LO",        lobe="occipital",
+         wiki="Lateral occipital cortex — BA19/37",
+         function="Object recognition, shape completion, LOC",
+         source="Malach et al. 1995",
+         destrieux_exact=["G_oc-temp_med-Lingual",
+                           "S_oc-temp_med_and_Lingual"]),
 
     # ── Temporal lobe ─────────────────────────────────────────────────────
     dict(key="A1",  label="A1 (Heschl)", lobe="temporal",
@@ -153,6 +185,33 @@ ROIS = [
          destrieux_exact=["G_temporal_inf",
                            "S_oc-temp_med_and_Lingual"]),
 
+    # NEW: Temporal Pole — person familiarity and semantic identity
+    # Pole_temporal is an exact aparc.a2009s label.
+    # THE target for specific-person desensitisation (Goal B).
+    dict(key="TP",  label="Temporal Pole", lobe="temporal",
+         wiki="Temporal pole (BA38) — person semantics",
+         function="Familiar person recognition, person-semantic memory, "
+                  "connecting face identity to autobiographical knowledge",
+         source="Olson et al. 2013; Diano et al. 2024 PNAS",
+         destrieux_exact=["Pole_temporal"]),
+
+    # NEW: Anterior Temporal Lobe face area (ATL-FA)
+    # Responds more to personally familiar than unfamiliar faces.
+    dict(key="ATL", label="ATL-FA",     lobe="temporal",
+         wiki="Anterior temporal face area — familiar person identity",
+         function="Person identity storage; familiarity beyond FFA; "
+                  "links perceptual face to biographical knowledge",
+         source="Rossion 2014; Von der Heide et al. 2013",
+         destrieux_exact=["G_temporal_inf",
+                           "G_oc-temp_med-Parahip"]),
+
+    # NEW: Planum Temporale — emotional prosody, audiovisual content
+    dict(key="PT",  label="Planum Temporale", lobe="temporal",
+         wiki="Planum temporale — posterior lateral fissure (BA42/22)",
+         function="Auditory scene analysis, emotional prosody, music",
+         source="Griffiths & Warren 2002",
+         destrieux_exact=["Lat_Fis-post"]),
+
     # ── Parietal lobe ─────────────────────────────────────────────────────
     dict(key="S1",  label="S1",         lobe="parietal",
          wiki="Primary somatosensory cortex (BA1/2/3)",
@@ -182,6 +241,32 @@ ROIS = [
          destrieux_exact=["G_cingul-Post-dorsal",
                            "G_cingul-Post-ventral",
                            "S_cingul-Marginalis"]),
+
+    # NEW: Precuneus — mental imagery, autobiographical memory, self-simulation
+    # When you "think about" your ex, precuneus generates the mental image.
+    dict(key="PREC", label="Precuneus",  lobe="parietal",
+         wiki="Precuneus (BA7) — visual mental imagery & autobiographical memory",
+         function="Mental imagery of people/scenes, visuospatial episodic memory, "
+                  "self-referential simulation",
+         source="Cavanna & Trimble 2006",
+         destrieux_exact=["G_precuneus",
+                           "S_subparietal"]),
+
+    # NEW: Temporo-Parietal Junction — theory of mind, person models
+    dict(key="TPJ", label="TPJ",         lobe="parietal",
+         wiki="Temporo-parietal junction (BA39/40 border)",
+         function="Theory of mind, mentalising, person model construction",
+         source="Saxe & Kanwisher 2003",
+         destrieux_exact=["G_and_S_subcentral",
+                           "S_interm_prim-Jensen"]),
+
+    # NEW: Medial Parietal Cortex — autobiographical retrieval node
+    dict(key="MPC", label="MPC",         lobe="parietal",
+         wiki="Medial parietal cortex / posterior DMN",
+         function="Autobiographical memory retrieval, narrative self",
+         source="Spreng et al. 2009",
+         destrieux_exact=["S_subparietal",
+                           "G_cingul-Post-ventral"]),
 
     # ── Frontal lobe ──────────────────────────────────────────────────────
     dict(key="M1",    label="M1",          lobe="frontal",
@@ -217,9 +302,11 @@ ROIS = [
                            "S_front_inf"]),
 
     dict(key="OFC",   label="OFC",          lobe="frontal",
-         wiki="Orbitofrontal cortex (BA11/47)",
-         function="Reward valuation, emotion regulation, disgust",
-         source="Wallis 2007; Rolls 2019",
+         wiki="Orbitofrontal cortex (BA11/47) — reward valuation",
+         function="Reward valuation, emotion regulation, disgust, "
+                  "subjective value of visual sexual stimuli (VSS); "
+                  "lateral OFC encodes erotic pleasure (Voon et al. 2014)",
+         source="Wallis 2007; Rolls 2019; ScienceDirect 2020 (VSS reward)",
          destrieux_exact=["G_orbital",
                            "G_rectus",
                            "S_orbital_lateral",
@@ -228,25 +315,39 @@ ROIS = [
                            "S_suborbital"]),
 
     dict(key="MPFC",  label="mPFC/vmPFC",   lobe="frontal",
-         wiki="Medial PFC (BA10/25)",
-         function="Default mode, self-referential processing, social cognition",
-         source="Amodio & Frith 2006",
+         wiki="Medial PFC (BA10/25) — self-referential & reward",
+         function="Default mode, self-referential processing, social cognition; "
+                  "vmPFC encodes subjective sexual arousal and cue reactivity "
+                  "in problematic pornography use (Voon et al. 2014)",
+         source="Amodio & Frith 2006; Voon et al. 2014",
          destrieux_exact=["G_and_S_frontomargin",
                            "G_and_S_transv_frontopol",
                            "G_subcallosal"]),
 
     dict(key="ACC",   label="ACC",           lobe="frontal",
          wiki="Anterior cingulate cortex (BA24/32)",
-         function="Conflict monitoring, pain affect, error detection, salience",
-         source="Bush et al. 2000",
+         function="Conflict monitoring, pain affect, error detection, salience; "
+                  "ventral ACC activated during pornographic CS+ conditioning "
+                  "(Klucken et al. 2016)",
+         source="Bush et al. 2000; Klucken et al. 2016",
          destrieux_exact=["G_and_S_cingul-Ant",
                            "G_and_S_cingul-Mid-Ant",
                            "G_and_S_cingul-Mid-Post"]),
 
+    # NEW: Frontal Pole / frontopolar PFC — craving suppression & prospection
+    dict(key="FPC",   label="FPC",           lobe="frontal",
+         wiki="Frontal pole / frontopolar PFC (BA10)",
+         function="Prospective thinking, craving suppression, "
+                  "hyper-connected in pornography addiction (Frontiers 2025)",
+         source="Koechlin et al. 2003; Frontiers Hum Neurosci 2025",
+         destrieux_exact=["G_and_S_frontomargin",
+                           "G_and_S_transv_frontopol"]),
+
     # ── Insula ────────────────────────────────────────────────────────────
     dict(key="INS",   label="Insula",        lobe="insula",
-         wiki="Insular cortex (BA13/14)",
-         function="Interoception, disgust, pain, empathy, salience network hub",
+         wiki="Insular cortex (BA13/14) — interoception & disgust",
+         function="Interoception, disgust, pain, empathy, salience network hub; "
+                  "anterior insula encodes visceral disgust response to gore",
          source="Craig 2002; Uddin 2015",
          destrieux_exact=["G_Ins_lg_and_S_cent_ins",
                            "G_insular_short",
@@ -254,6 +355,27 @@ ROIS = [
                            "S_circular_insula_inf",
                            "S_circular_insula_sup"]),
 ]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SUBCORTICAL DISCLAIMER — printed at runtime
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SUBCORTICAL_NOTE = """
+NOTE ON ABLITERATION TARGETS NOT REACHABLE VIA fsaverage5 SURFACE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+The primary reward/craving circuit for pornography addiction is:
+  VTA → nucleus accumbens → caudate/putamen → amygdala → OFC
+Of these, only OFC is on the cortical surface.  NAcc, caudate, amygdala,
+and VTA are subcortical and cannot be mapped by TRIBE v2.
+
+For Goal A (porn abliteration), use OFC + vmPFC/MPFC + ACC + FPC
+as cortical proxies.  These regions reliably co-activate with NAcc
+(Voon et al. 2014; ScienceDirect 2020 VSS reward) and are reachable.
+
+For Goal B (face desensitisation), the critical cortical chain is:
+  V1/V2 → OFA → FFA → STS → ATL → TP → PREC/mPFC → PCC
+All these ARE on the surface and are in the ROI table above.
+"""
 
 LOBE_COLORS = {
     "occipital": "#4fc3f7",
@@ -268,6 +390,7 @@ LOBE_COLORS = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 print("Building ROI masks from Destrieux atlas (fsaverage5) …")
+print(_SUBCORTICAL_NOTE)
 try:
     from nilearn import datasets as nl_datasets
     destrieux   = nl_datasets.fetch_atlas_surf_destrieux()
@@ -337,7 +460,8 @@ layer_acts = {}
 def make_hook(idx):
     def hook(module, input, output):
         hidden = output[0] if isinstance(output, tuple) else output
-        layer_acts[idx] = hidden.mean(dim=1)[0].detach().float().cpu().numpy()
+        # hidden: (B, tokens, dim)  — average over tokens then over batch
+        layer_acts[idx] = hidden.mean(dim=1).mean(dim=0).detach().float().cpu().numpy()
     return hook
 
 def register_all_hooks():
@@ -356,8 +480,9 @@ def free_memory():
 
 USE_AMP = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
 
-def run_forward(clip_tensor):
-    inp = clip_tensor.unsqueeze(0).to(DEVICE)
+def run_forward(batch_clips):
+    """batch_clips: list of clip tensors, each (T, 3, H, W).  Run as a batch."""
+    inp = torch.stack(batch_clips, dim=0).to(DEVICE)   # (B, T, 3, H, W)
     with torch.no_grad():
         if USE_AMP:
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
@@ -423,22 +548,35 @@ def iter_clips(path):
 # Pass 1: extract V-JEPA2 layer activations for all categories
 # ─────────────────────────────────────────────────────────────────────────────
 
-print("\nExtracting V-JEPA2 layer activations …")
+print(f"\nExtracting V-JEPA2 layer activations (batch={INFERENCE_BATCH}) …")
 cat_layer_acts = {}
 
 for cat in CATEGORIES:
-    vpaths = sorted(DATA_DIR.glob(f"{cat}*.mp4"))[:N_VIDEOS_PER_CAT]
+    vpaths = sorted(DATA_DIR.glob(f"{cat}*.mp4"))
     if not vpaths:
         continue
     clips = []
     for vp in vpaths:
         handles = register_all_hooks()
         try:
+            pending = []
             for clip in iter_clips(vp):
+                pending.append(clip)
+                if len(pending) == INFERENCE_BATCH:
+                    layer_acts.clear()
+                    run_forward(pending)
+                    if len(layer_acts) == N_LAYERS:
+                        # store one averaged activation row per clip in batch
+                        for _ in pending:
+                            clips.append(np.stack([layer_acts[i] for i in range(N_LAYERS)]))
+                    pending = []
+                    free_memory()
+            if pending:   # flush remainder
                 layer_acts.clear()
-                run_forward(clip)
+                run_forward(pending)
                 if len(layer_acts) == N_LAYERS:
-                    clips.append(np.stack([layer_acts[i] for i in range(N_LAYERS)]))
+                    for _ in pending:
+                        clips.append(np.stack([layer_acts[i] for i in range(N_LAYERS)]))
                 free_memory()
         except Exception as e:
             print(f"  [ERROR] {vp.name}: {e}")
@@ -463,7 +601,7 @@ video_n     = {cat: {roi["key"]: 0 for roi in ROIS}
                for cat in CATEGORIES}
 
 for cat in CATEGORIES:
-    vpaths = sorted(DATA_DIR.glob(f"{cat}*.mp4"))[:N_VIDEOS_PER_CAT]
+    vpaths = sorted(DATA_DIR.glob(f"{cat}*.mp4"))
     for vp in vpaths:
         preds_path = STUDY_ROOT / cat / vp.stem / "preds.npy"
         if not preds_path.exists():
@@ -476,11 +614,23 @@ for cat in CATEGORIES:
 
         clips, handles = [], register_all_hooks()
         try:
+            pending = []
             for clip in iter_clips(vp):
+                pending.append(clip)
+                if len(pending) == INFERENCE_BATCH:
+                    layer_acts.clear()
+                    run_forward(pending)
+                    if len(layer_acts) == N_LAYERS:
+                        for _ in pending:
+                            clips.append(np.stack([layer_acts[i] for i in range(N_LAYERS)]))
+                    pending = []
+                    free_memory()
+            if pending:
                 layer_acts.clear()
-                run_forward(clip)
+                run_forward(pending)
                 if len(layer_acts) == N_LAYERS:
-                    clips.append(np.stack([layer_acts[i] for i in range(N_LAYERS)]))
+                    for _ in pending:
+                        clips.append(np.stack([layer_acts[i] for i in range(N_LAYERS)]))
                 free_memory()
         except Exception as e:
             print(f"  [ERROR] {vp.name}: {e}")
@@ -517,14 +667,14 @@ for cat in CATEGORIES:
             layer_roi_r[cat][k] /= video_n[cat][k]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Plotting
+# Plotting  (rendered in parallel across all CPU cores)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DARK_BG   = "#0d0d0d"
 SPINE_COL = "#444444"
 layer_idx = np.arange(N_LAYERS)
 CAT_COLORS = {c: col for c, col in zip(
-    CATEGORIES, plt.cm.tab10(np.linspace(0, 1, len(CATEGORIES)))
+    CATEGORIES, plt.cm.tab20(np.linspace(0, 1, len(CATEGORIES)))
 )}
 
 def _style(ax, title="", ylabel="", xlabel=""):
@@ -546,10 +696,16 @@ def _style(ax, title="", ylabel="", xlabel=""):
 
 # ── Plot A: one file per ROI — all categories as lines ────────────────────────
 
-print("\nPlot A: per-ROI layer–fMRI correlation …")
-for roi in ROIS:
+def _plot_A_roi(args):
+    roi, layer_roi_r, video_n, cats_with_data, CAT_COLORS, \
+        TRIBE_LAYERS, N_LAYERS, LOBE_COLORS, ANALYSIS_DIR = args
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    DARK_BG = "#0d0d0d"; SPINE_COL = "#444444"
+    layer_idx = np.arange(N_LAYERS)
     key = roi["key"]
-    col = LOBE_COLORS[roi["lobe"]]
     fig, ax = plt.subplots(figsize=(16, 5))
     fig.patch.set_facecolor(DARK_BG)
     ax.set_facecolor(DARK_BG)
@@ -560,28 +716,51 @@ for roi in ROIS:
                 label=f"{cat} (n={video_n[cat][key]})",
                 color=CAT_COLORS.get(cat, "white"), linewidth=1.8, alpha=0.9)
     ax.axhline(0, color="#555", linewidth=0.8)
-    _style(ax,
-           title=(f"{roi['label']}  [{roi['wiki']}]\n{roi['function']}"),
-           ylabel="Mean Pearson r  (layer activation norm → ROI BOLD)",
-           xlabel="V-JEPA2 layer index  (0 = shallowest, 39 = deepest)")
+    ax.set_facecolor(DARK_BG)
+    ax.tick_params(colors="white", labelsize=8)
+    ax.set_xlabel("V-JEPA2 layer index  (0 = shallowest, 39 = deepest)", color="white", fontsize=9)
+    ax.set_ylabel("Mean Pearson r  (layer activation norm → ROI BOLD)", color="white", fontsize=9)
+    ax.set_title(f"{roi['label']}  [{roi['wiki']}]\n{roi['function']}", color="white", fontsize=9, pad=4)
+    for sp in ["top", "right"]: ax.spines[sp].set_visible(False)
+    for sp in ["bottom", "left"]: ax.spines[sp].set_color(SPINE_COL)
+    ax.set_xlim(-0.5, N_LAYERS - 0.5)
+    for li, lbl in TRIBE_LAYERS.items():
+        ax.axvline(li, color="#666", linestyle="--", linewidth=0.9, alpha=0.7)
+        ylim = ax.get_ylim()
+        ax.text(li + 0.2, ylim[0] + (ylim[1]-ylim[0])*0.97, lbl, color="#777", fontsize=6, va="top")
     ax.legend(facecolor="#111", labelcolor="white", framealpha=0.85,
-              fontsize=8, ncol=4, loc="upper left")
+              fontsize=7, ncol=4, loc="upper left")
     ax.text(0.99, 0.02, f"Source: {roi['source']}",
-            color="#666", fontsize=6, ha="right", va="bottom",
-            transform=ax.transAxes)
+            color="#666", fontsize=6, ha="right", va="bottom", transform=ax.transAxes)
     plt.tight_layout()
-    plt.savefig(OUT_DIR / f"roiA_{key.lower()}.png",
+    plt.savefig(str(ANALYSIS_DIR / f"roiA_{key.lower()}.png"),
                 dpi=150, bbox_inches="tight", facecolor=DARK_BG)
     plt.close()
+    return key
+
+print(f"\nPlot A: per-ROI layer–fMRI correlation ({N_PLOT_WORKERS} workers) …")
+_args_A = [
+    (roi, layer_roi_r, video_n, cats_with_data, CAT_COLORS,
+     TRIBE_LAYERS, N_LAYERS, LOBE_COLORS, ANALYSIS_DIR)
+    for roi in ROIS
+]
+with ProcessPoolExecutor(max_workers=N_PLOT_WORKERS) as ex:
+    list(ex.map(_plot_A_roi, _args_A))
 print(f"  {len(ROIS)} files saved")
 
 # ── Plot B: per-category — all ROIs as bar grid ───────────────────────────────
 
-print("Plot B: per-category ROI grid …")
-N_COLS = 4
-N_ROWS = (len(ROIS) + N_COLS - 1) // N_COLS
-
-for cat in cats_with_data:
+def _plot_B_cat(args):
+    cat, ROIS, layer_roi_r, video_n, LOBE_COLORS, TRIBE_LAYERS, \
+        N_LAYERS, SPINE_COL, ANALYSIS_DIR = args
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import numpy as np
+    DARK_BG = "#0d0d0d"
+    layer_idx = np.arange(N_LAYERS)
+    N_COLS = 4
+    N_ROWS = (len(ROIS) + N_COLS - 1) // N_COLS
     fig, axes = plt.subplots(N_ROWS, N_COLS, figsize=(22, 4*N_ROWS), sharex=True)
     fig.patch.set_facecolor(DARK_BG)
     aflat = axes.flatten()
@@ -600,10 +779,8 @@ for cat in cats_with_data:
         ax.set_title(f"{roi['label']}  n={video_n[cat][roi['key']]}",
                      color=col, fontsize=9)
         ax.tick_params(colors="white", labelsize=7)
-        for sp in ["top","right"]:
-            ax.spines[sp].set_visible(False)
-        for sp in ["bottom","left"]:
-            ax.spines[sp].set_color(SPINE_COL)
+        for sp in ["top","right"]: ax.spines[sp].set_visible(False)
+        for sp in ["bottom","left"]: ax.spines[sp].set_color(SPINE_COL)
         ax.set_xlim(-0.5, N_LAYERS-0.5)
         if ri % N_COLS == 0:
             ax.set_ylabel("Pearson r", color="white", fontsize=8)
@@ -616,9 +793,19 @@ for cat in cats_with_data:
         "bar label = top-3 layer indices  |  --- = TRIBE v2 sampled layers (19, 39)",
         color="white", fontsize=11, y=1.005)
     plt.tight_layout()
-    plt.savefig(OUT_DIR / f"roiB_cat_{cat}.png",
+    plt.savefig(str(ANALYSIS_DIR / f"roiB_cat_{cat}.png"),
                 dpi=150, bbox_inches="tight", facecolor=DARK_BG)
     plt.close()
+    return cat
+
+print(f"Plot B: per-category ROI grid ({N_PLOT_WORKERS} workers) …")
+_args_B = [
+    (cat, ROIS, layer_roi_r, video_n, LOBE_COLORS, TRIBE_LAYERS,
+     N_LAYERS, SPINE_COL, ANALYSIS_DIR)
+    for cat in cats_with_data
+]
+with ProcessPoolExecutor(max_workers=N_PLOT_WORKERS) as ex:
+    list(ex.map(_plot_B_cat, _args_B))
 print(f"  {len(cats_with_data)} files saved")
 
 # ── Plot C: grand heatmap — categories × ROIs ─────────────────────────────────
@@ -669,7 +856,7 @@ for ri, roi in enumerate(ROIS):
         ax.axvline(ri-0.5, color="#888", linewidth=1.2, linestyle=":")
     prev_lobe = roi["lobe"]
 plt.tight_layout()
-plt.savefig(OUT_DIR / "roiC_summary_heatmap.png",
+plt.savefig(ANALYSIS_DIR / "roiC_summary_heatmap.png",
             dpi=150, bbox_inches="tight", facecolor=DARK_BG)
 plt.close()
 print(f"  Saved roiC_summary_heatmap.png")
@@ -706,21 +893,93 @@ for sp in ["bottom","left"]:
 ax.legend(facecolor="#111", labelcolor="white", framealpha=0.85,
           fontsize=9, ncol=4)
 plt.tight_layout()
-plt.savefig(OUT_DIR / "roiD_lobe_summary.png",
+plt.savefig(ANALYSIS_DIR / "roiD_lobe_summary.png",
             dpi=150, bbox_inches="tight", facecolor=DARK_BG)
 plt.close()
 print(f"  Saved roiD_lobe_summary.png")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Abliteration contrast maps
+# ─────────────────────────────────────────────────────────────────────────────
+# These contrasts directly inform which ROIs and which V-JEPA2 layers to target
+# for weight surgery.  Contrasts referencing categories with no data are skipped.
+
+ABLITERATION_CONTRASTS = [
+    dict(label="Porn vs Gore",
+         pos="porn",   neg="gore",
+         title="PORN vs GORE  —  sexual vs violent"),
+    dict(label="Porn vs Cute",
+         pos="porn",   neg="cute",
+         title="PORN vs CUTE  —  sexual specificity (controls arousal)"),
+    dict(label="Gore vs Fight",
+         pos="gore",   neg="fight",
+         title="GORE vs FIGHT  —  violence specificity (controls motion)"),
+    dict(label="Porn vs Kissing",
+         pos="porn",   neg="kissing",
+         title="PORN vs KISSING  —  explicit sexual vs intimate non-explicit"),
+]
+
+print("Plot E: abliteration contrast maps …")
+for contrast in ABLITERATION_CONTRASTS:
+    pos_cat = contrast["pos"]
+    neg_cat = contrast["neg"]
+    if pos_cat not in cats_with_data or neg_cat not in cats_with_data:
+        print(f"  Skipping '{contrast['label']}' — missing data")
+        continue
+
+    diff_peak = np.zeros(len(ROIS))
+    diff_layer = np.zeros(len(ROIS), dtype=int)
+    for ri, roi in enumerate(ROIS):
+        rp = layer_roi_r[pos_cat][roi["key"]]
+        rn = layer_roi_r[neg_cat][roi["key"]]
+        diff = rp - rn
+        b = int(np.argmax(np.abs(diff)))
+        diff_layer[ri] = b
+        diff_peak[ri]  = diff[b]
+
+    fig, ax = plt.subplots(figsize=(max(14, len(ROIS)*0.9), 5))
+    fig.patch.set_facecolor(DARK_BG)
+    ax.set_facecolor(DARK_BG)
+    bar_colors = [LOBE_COLORS[roi["lobe"]] for roi in ROIS]
+    bars = ax.bar(range(len(ROIS)), diff_peak, color=bar_colors, alpha=0.85)
+    ax.axhline(0, color="#555", linewidth=0.8)
+    for ri, (bar, layer) in enumerate(zip(bars, diff_layer)):
+        ypos = diff_peak[ri]
+        ax.text(ri, ypos + 0.003*np.sign(ypos),
+                f"L{layer}", color="white", fontsize=6.5,
+                ha="center", va="bottom" if ypos >= 0 else "top")
+    ax.set_xticks(range(len(ROIS)))
+    ax.set_xticklabels([r["label"] for r in ROIS],
+                       rotation=45, ha="right", color="white", fontsize=8)
+    ax.set_ylabel(f"Δ Pearson r  ({pos_cat} − {neg_cat})", color="white", fontsize=9)
+    ax.set_title(contrast["title"], color="white", fontsize=10)
+    ax.tick_params(colors="white")
+    for sp in ["top", "right"]:
+        ax.spines[sp].set_visible(False)
+    for sp in ["bottom", "left"]:
+        ax.spines[sp].set_color(SPINE_COL)
+    prev_lobe = None
+    for ri, roi in enumerate(ROIS):
+        if roi["lobe"] != prev_lobe and prev_lobe is not None:
+            ax.axvline(ri-0.5, color="#666", linewidth=1.0, linestyle=":")
+        prev_lobe = roi["lobe"]
+    plt.tight_layout()
+    safe_label = contrast["label"].replace(" ", "_").replace("/", "-")
+    plt.savefig(ANALYSIS_DIR / f"roiE_contrast_{safe_label}.png",
+                dpi=150, bbox_inches="tight", facecolor=DARK_BG)
+    plt.close()
+    print(f"  Saved: roiE_contrast_{safe_label}.png")
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Printed mapping table
 # ─────────────────────────────────────────────────────────────────────────────
 
-print("\n" + "="*82)
+print("\n" + "="*90)
 print("DEFINITIVE LAYER → BRAIN REGION MAPPING")
-print("="*82)
-print(f"{'ROI':<10} {'Wiki region':<44} {'Best cat':<10} "
+print("="*90)
+print(f"{'ROI':<12} {'Wiki region':<46} {'Best cat':<14} "
       f"{'peak r':>7}  {'layer':>5}  {'depth':>5}")
-print("-"*82)
+print("-"*90)
 for roi in ROIS:
     key = roi["key"]
     best_cat, best_r, best_layer = None, -999.0, -1
@@ -729,22 +988,44 @@ for roi in ROIS:
         li = int(np.argmax(np.abs(r)))
         if abs(r[li]) > abs(best_r):
             best_r, best_cat, best_layer = r[li], cat, li
-    print(f"{roi['label']:<10} {roi['wiki'][:42]:<44} {str(best_cat):<10} "
+    print(f"{roi['label']:<12} {roi['wiki'][:44]:<46} {str(best_cat):<14} "
           f"{best_r:>+7.4f}  {best_layer:>5d}  {best_layer/N_LAYERS:>5.2f}")
 
+print("\n" + "="*90)
+print("ABLITERATION TARGET SUMMARY")
+print("="*90)
+print("""
+Goal A — Porn addiction (cortical proxies for NAcc reward circuit):
+  Primary:   OFC  (reward valuation of VSS, lateral OFC = erotic pleasure)
+             MPFC (cue reactivity, vmPFC subjective arousal)
+             ACC  (ventral ACC activated in porn CS+ conditioning)
+  Secondary: FPC  (frontopolar — hyper-connected in addicted group)
+             INS  (anterior insula — craving interoception)
+  Contrast to use: 'Porn vs Kissing' and 'Porn vs Cute'
+
+Goal B — Food addiction (palatability-driven overconsumption):
+  Primary:   OFC  (palatability valuation; food cue reward encoding)
+             INS  (visceral interoception; gut-to-cortex craving signal)
+             ACC  (conflict monitoring during food cue exposure)
+  Secondary: MPFC (self-relevance of food cues, cue-reactivity)
+             FPC  (top-down craving suppression / dietary control)
+  Contrast to use: 'Food vs Nature'
+  Key refs: Stoeckel et al. 2008; Jastreboff et al. 2013
+  Weight surgery should target the layer + ROI with peak Δr.
+""")
+
 print("\nREGIONS NOT MAPPABLE (outside fsaverage5 cortical surface):")
-for r in ["Medulla oblongata & all nuclei",
-          "Pons & pontine nuclei", "Cerebellum",
-          "Midbrain (tectum, tegmentum, SN, VTA, PAG, red nucleus)",
-          "Thalamus & all thalamic nuclei",
-          "Hypothalamus & all nuclei / pituitary",
+for r in ["Nucleus accumbens  ← PRIMARY porn-reward target (subcortical)",
+          "Caudate / Putamen  ← habit-formation in addiction",
+          "Amygdala           ← emotional salience / fear conditioning",
+          "VTA / Substantia nigra  ← dopamine source",
           "Hippocampus  (subcortical in FreeSurfer)",
-          "Amygdala  (subcortical)",
-          "Basal ganglia (striatum, GP, STN, claustrum)",
-          "All white-matter tracts & commissures",
-          "Ventricular system / CSF"]:
+          "Thalamus & all thalamic nuclei",
+          "Hypothalamus & nuclei",
+          "Brainstem, cerebellum",
+          "All white-matter tracts & ventricular system"]:
     print(f"  ✗  {r}")
 
-print(f"\nAll outputs → {OUT_DIR.resolve()}")
-for f in sorted(OUT_DIR.glob("roi*.png")):
+print(f"\nAll outputs → {ANALYSIS_DIR.resolve()}")
+for f in sorted(ANALYSIS_DIR.glob("roi*.png")):
     print(f"  {f.name}")
