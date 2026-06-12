@@ -106,10 +106,10 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CATEGORIES = [
     # original
-    "porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight",
+    "porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight", "sports", "argument",
     # new
     "face_familiar", "face_unknown", "erotic_static",
-    "disgust", "craving_neutral", "sport", "relax",
+    "disgust", "craving_neutral", "relax",
 ]
 
 CLIP_FRAMES   = 16

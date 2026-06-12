@@ -45,13 +45,18 @@ MASK_DIR.mkdir(parents=True, exist_ok=True)
 
 LAYER_PROFILE_PATH = MASK_DIR / "layer_profiles.npz"   # written by layer_analysis.py
 
-ALL_CATEGORIES = ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]
+def discover_categories():
+    """Auto-discover categories from subdirectory names in DATA_DIR."""
+    return sorted([d.name for d in DATA_DIR.iterdir()
+                   if d.is_dir() and any(d.glob("*.mp4"))])
+
+ALL_CATEGORIES = discover_categories()
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--target",       type=str,   required=True,
-                    help="Target category to abliterate (e.g. porn, gore)")
+                    help="Target category to abliterate (e.g. porn)")
 parser.add_argument("--tolerance",    type=float, default=-0.8,
                     help="Tolerance scale: -1=repulsion, 0=neutral, +1=attraction")
 parser.add_argument("--n_components", type=int,   default=1)
@@ -60,7 +65,8 @@ parser.add_argument("--layer_mode",   choices=["auto", "fixed", "dual"], default
 args = parser.parse_args()
 
 if args.target not in ALL_CATEGORIES:
-    sys.exit(f"[FATAL] Unknown target '{args.target}'. Must be one of: {ALL_CATEGORIES}")
+    sys.exit(f"[FATAL] Unknown target '{args.target}'. "
+             f"Available: {ALL_CATEGORIES}")
 
 TARGET_CAT     = args.target
 BASELINE_CATS  = [c for c in ALL_CATEGORIES if c != TARGET_CAT]
@@ -71,6 +77,7 @@ CLIP_DURATION = 4
 IMG_SIZE      = 256
 MAX_TRS       = 30
 
+print(f"Discovered {len(ALL_CATEGORIES)} categories: {ALL_CATEGORIES}")
 print(f"Target:    {TARGET_CAT}")
 print(f"Baselines: {BASELINE_CATS}  (n={len(BASELINE_CATS)})")
 
@@ -117,10 +124,11 @@ def make_strict_mask(contrast, pct=90):
 
 def score_mask(target_cat, mask, means, categories):
     """
-    Composite score:
+    Composite score — fully data-driven, no hardcoded category assumptions.
       1. selectivity = target_mean - mean_of_others  (higher is better)
-      2. food_penalty = max(0, food_mean - target_mean)  (zero is ideal)
-      3. n_verts >= 100 sanity gate
+      2. max_leak = max activation of any non-target category in this mask
+      3. leak_penalty = max(0, max_leak - target_mean)  (zero is ideal)
+      4. n_verts >= 100 sanity gate
     Returns None if mask fails the gate.
     """
     if mask.sum() < 100:
@@ -128,10 +136,10 @@ def score_mask(target_cat, mask, means, categories):
     target_val = float(means[target_cat][mask].mean())
     other_cats = [c for c in categories if c != target_cat]
     other_val  = float(np.stack([means[c][mask] for c in other_cats]).mean())
-    food_val   = float(means["food"][mask].mean())
+    max_leak   = float(max(means[c][mask].mean() for c in other_cats))
     selectivity  = target_val - other_val
-    food_penalty = max(0.0, food_val - target_val)
-    return selectivity - 2.0 * food_penalty
+    leak_penalty = max(0.0, max_leak - target_val)
+    return selectivity - 2.0 * leak_penalty
 
 def run_strict_mask_generation():
     """Phase 0: generate contrast masks and auto-select the best one for TARGET_CAT."""
@@ -142,58 +150,34 @@ def run_strict_mask_generation():
     print("Loading category means...")
     means = {cat: load_category_mean(cat) for cat in ALL_CATEGORIES}
 
-    # ── Build contrasts ────────────────────────────────────────────────────
-    # baseline = mean of all non-target categories
+    # ── Build contrasts — fully data-driven LOSO ───────────────────────────
+    # No hardcoded neutral_low / neutral_high / confound_map.
+
+    # 1. LOSO: target vs mean of all baselines
     baseline_mean = np.stack([means[c] for c in BASELINE_CATS]).mean(axis=0)
-
-    # 1. Target vs all baselines
-    target_allneutral = means[TARGET_CAT] - baseline_mean
-
-    # 2. Target-specific: cross-subtract with each other target-like category
-    #    (if target is porn, subtract gore contrast and vice versa)
-    other_targets = [c for c in ["porn", "gore"] if c != TARGET_CAT]
-    if other_targets:
-        other_contrast = means[other_targets[0]] - baseline_mean
-        target_specific = target_allneutral - other_contrast
-    else:
-        target_specific = target_allneutral
-
-    # 3. Target vs closest confounds (high visual similarity)
-    confound_map = {
-        "porn": ["kissing", "chase"],
-        "gore": ["fight", "chase"],
-    }
-    confounds = confound_map.get(TARGET_CAT, BASELINE_CATS[:2])
-    target_tight = means[TARGET_CAT] - np.stack([means[c] for c in confounds]).mean(axis=0)
-
-    # 4. Target with explicit food exclusion
-    no_food_baselines = [c for c in BASELINE_CATS if c != "food"]
-    target_no_food = means[TARGET_CAT] - np.stack(
-        [means[c] for c in no_food_baselines]
-    ).mean(axis=0)
+    target_loso = means[TARGET_CAT] - baseline_mean
 
     CONTRASTS = {
-        f"{TARGET_CAT}_allneutral": target_allneutral,
-        f"{TARGET_CAT}_specific":   target_specific,
-        f"{TARGET_CAT}_tight":      target_tight,
-        f"{TARGET_CAT}_no_food":    target_no_food,
+        f"{TARGET_CAT}_loso": target_loso,
     }
 
-    # 5. Bicontrast: target > every other category individually (logical AND)
-    bicontrast_mask = np.ones(len(baseline_mean), dtype=bool)
-    for c in BASELINE_CATS:
-        bicontrast_mask &= (means[TARGET_CAT] - means[c] > 0)
-    # Also require > other targets
-    for c in other_targets:
-        bicontrast_mask &= (means[TARGET_CAT] - means[c] > 0)
-    CONTRASTS[f"{TARGET_CAT}_strict_bicontrast"] = None  # mask-only, no contrast array
+    # 2. LOSO-k: leave one baseline out at a time, build contrast
+    #    This discovers which baselines are confounds without hardcoding.
+    for leave_out in BASELINE_CATS:
+        remaining = [c for c in BASELINE_CATS if c != leave_out]
+        remaining_mean = np.stack([means[c] for c in remaining]).mean(axis=0)
+        CONTRASTS[f"{TARGET_CAT}_drop_{leave_out}"] = means[TARGET_CAT] - remaining_mean
 
-    # 6. Multivariate all: target > every single other category
-    multivariate_mask = np.ones(len(baseline_mean), dtype=bool)
+    # 3. Pairwise: target vs each individual baseline
+    for base in BASELINE_CATS:
+        CONTRASTS[f"{TARGET_CAT}_vs_{base}"] = means[TARGET_CAT] - means[base]
+
+    # 4. Multivariate strict: target > every single other category (logical AND)
+    multivariate_mask = np.ones(baseline_mean.shape, dtype=bool)
     for c in ALL_CATEGORIES:
         if c != TARGET_CAT:
             multivariate_mask &= (means[TARGET_CAT] - means[c] > 0)
-    CONTRASTS[f"{TARGET_CAT}_strict_multivariate_all"] = None
+    CONTRASTS[f"{TARGET_CAT}_strict_multivariate"] = None  # mask-only
 
     # ── Generate masks ─────────────────────────────────────────────────────
     print(f"\n{'Name':35s}  {'n_verts':>8}  {'LH':>6}  {'RH':>6}  {'mean_val':>10}")
@@ -203,8 +187,6 @@ def run_strict_mask_generation():
     for name, data in CONTRASTS.items():
         if data is not None:
             mask = make_strict_mask(data, pct=90)
-        elif "bicontrast" in name:
-            mask = bicontrast_mask
         elif "multivariate" in name:
             mask = multivariate_mask
         else:
@@ -444,10 +426,10 @@ def run_activation_collection(config, vjepa2_module, encoder_blocks, n_layers):
     acts_dir  = OUT_DIR / f"acts_{TARGET_CAT}"
     acts_dir.mkdir(exist_ok=True)
 
-    # Find target videos in data/targets/
-    video_files = sorted((DATA_DIR / "targets").glob(f"{TARGET_CAT}*.mp4"))
+    # Find target videos in data/{TARGET_CAT}/
+    video_files = sorted((DATA_DIR / TARGET_CAT).glob("*.mp4"))
     if not video_files:
-        sys.exit(f"[FATAL] No videos found for {TARGET_CAT} in {DATA_DIR / 'targets'}")
+        sys.exit(f"[FATAL] No videos found for {TARGET_CAT} in {DATA_DIR / TARGET_CAT}")
 
     # Determine which layer to hook
     layer_profiles = load_layer_profiles()

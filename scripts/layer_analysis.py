@@ -64,17 +64,20 @@ CACHE_DIR  = Path("./cache")
 ANALYSIS_DIR    = Path("./analysis")
 ANALYSIS_DIR.mkdir(exist_ok=True)
 
+def discover_categories():
+    """Auto-discover categories from subdirectory names in DATA_DIR."""
+    return sorted([d.name for d in DATA_DIR.iterdir()
+                   if d.is_dir() and any(d.glob("*.mp4"))])
+
 def find_videos_for_category(cat):
-    """Search both baselines/ and targets/ for videos matching this category."""
-    results = []
-    for subdir in ["baselines", "targets"]:
-        results.extend(sorted((DATA_DIR / subdir).glob(f"{cat}*.mp4")))
-    return results
+    """Find all videos for a category in its data subfolder."""
+    return sorted((DATA_DIR / cat).glob("*.mp4"))
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-CATEGORIES        = ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]
+CATEGORIES        = discover_categories()
+print(f"Auto-discovered {len(CATEGORIES)} categories: {CATEGORIES}")
 CLIP_FRAMES       = 16
 CLIP_DURATION     = 4.0
 INFERENCE_BATCH   = 3          # clips processed per forward pass
@@ -907,76 +910,56 @@ plt.close()
 print(f"  Saved roiD_lobe_summary.png")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Abliteration contrast maps
+# Abliteration contrast maps — LOSO pairwise (fully data-driven)
 # ─────────────────────────────────────────────────────────────────────────────
-# These contrasts directly inform which ROIs and which V-JEPA2 layers to target
-# for weight surgery.  Contrasts referencing categories with no data are skipped.
+# Every ordered pair of categories with data is contrasted automatically.
+# No hardcoded assumptions about which categories are "neutral" or "target".
 
-ABLITERATION_CONTRASTS = [
-    dict(label="Porn vs Gore",
-         pos="porn",   neg="gore",
-         title="PORN vs GORE  —  sexual vs violent"),
-    dict(label="Porn vs Cute",
-         pos="porn",   neg="cute",
-         title="PORN vs CUTE  —  sexual specificity (controls arousal)"),
-    dict(label="Gore vs Fight",
-         pos="gore",   neg="fight",
-         title="GORE vs FIGHT  —  violence specificity (controls motion)"),
-    dict(label="Porn vs Kissing",
-         pos="porn",   neg="kissing",
-         title="PORN vs KISSING  —  explicit sexual vs intimate non-explicit"),
-]
+print("Plot E: LOSO pairwise contrast maps …")
+for i, pos_cat in enumerate(cats_with_data):
+    for neg_cat in cats_with_data[i+1:]:
+        diff_peak = np.zeros(len(ROIS))
+        diff_layer = np.zeros(len(ROIS), dtype=int)
+        for ri, roi in enumerate(ROIS):
+            rp = layer_roi_r[pos_cat][roi["key"]]
+            rn = layer_roi_r[neg_cat][roi["key"]]
+            diff = rp - rn
+            b = int(np.argmax(np.abs(diff)))
+            diff_layer[ri] = b
+            diff_peak[ri]  = diff[b]
 
-print("Plot E: abliteration contrast maps …")
-for contrast in ABLITERATION_CONTRASTS:
-    pos_cat = contrast["pos"]
-    neg_cat = contrast["neg"]
-    if pos_cat not in cats_with_data or neg_cat not in cats_with_data:
-        print(f"  Skipping '{contrast['label']}' — missing data")
-        continue
-
-    diff_peak = np.zeros(len(ROIS))
-    diff_layer = np.zeros(len(ROIS), dtype=int)
-    for ri, roi in enumerate(ROIS):
-        rp = layer_roi_r[pos_cat][roi["key"]]
-        rn = layer_roi_r[neg_cat][roi["key"]]
-        diff = rp - rn
-        b = int(np.argmax(np.abs(diff)))
-        diff_layer[ri] = b
-        diff_peak[ri]  = diff[b]
-
-    fig, ax = plt.subplots(figsize=(max(14, len(ROIS)*0.9), 5))
-    fig.patch.set_facecolor(DARK_BG)
-    ax.set_facecolor(DARK_BG)
-    bar_colors = [LOBE_COLORS[roi["lobe"]] for roi in ROIS]
-    bars = ax.bar(range(len(ROIS)), diff_peak, color=bar_colors, alpha=0.85)
-    ax.axhline(0, color="#555", linewidth=0.8)
-    for ri, (bar, layer) in enumerate(zip(bars, diff_layer)):
-        ypos = diff_peak[ri]
-        ax.text(ri, ypos + 0.003*np.sign(ypos),
-                f"L{layer}", color="white", fontsize=6.5,
-                ha="center", va="bottom" if ypos >= 0 else "top")
-    ax.set_xticks(range(len(ROIS)))
-    ax.set_xticklabels([r["label"] for r in ROIS],
-                       rotation=45, ha="right", color="white", fontsize=8)
-    ax.set_ylabel(f"Δ Pearson r  ({pos_cat} − {neg_cat})", color="white", fontsize=9)
-    ax.set_title(contrast["title"], color="white", fontsize=10)
-    ax.tick_params(colors="white")
-    for sp in ["top", "right"]:
-        ax.spines[sp].set_visible(False)
-    for sp in ["bottom", "left"]:
-        ax.spines[sp].set_color(SPINE_COL)
-    prev_lobe = None
-    for ri, roi in enumerate(ROIS):
-        if roi["lobe"] != prev_lobe and prev_lobe is not None:
-            ax.axvline(ri-0.5, color="#666", linewidth=1.0, linestyle=":")
-        prev_lobe = roi["lobe"]
-    plt.tight_layout()
-    safe_label = contrast["label"].replace(" ", "_").replace("/", "-")
-    plt.savefig(ANALYSIS_DIR / f"roiE_contrast_{safe_label}.png",
-                dpi=150, bbox_inches="tight", facecolor=DARK_BG)
-    plt.close()
-    print(f"  Saved: roiE_contrast_{safe_label}.png")
+        fig, ax = plt.subplots(figsize=(max(14, len(ROIS)*0.9), 5))
+        fig.patch.set_facecolor(DARK_BG)
+        ax.set_facecolor(DARK_BG)
+        bar_colors = [LOBE_COLORS[roi["lobe"]] for roi in ROIS]
+        bars = ax.bar(range(len(ROIS)), diff_peak, color=bar_colors, alpha=0.85)
+        ax.axhline(0, color="#555", linewidth=0.8)
+        for ri, (bar, layer) in enumerate(zip(bars, diff_layer)):
+            ypos = diff_peak[ri]
+            ax.text(ri, ypos + 0.003*np.sign(ypos),
+                    f"L{layer}", color="white", fontsize=6.5,
+                    ha="center", va="bottom" if ypos >= 0 else "top")
+        ax.set_xticks(range(len(ROIS)))
+        ax.set_xticklabels([r["label"] for r in ROIS],
+                           rotation=45, ha="right", color="white", fontsize=8)
+        ax.set_ylabel(f"Δ Pearson r  ({pos_cat} − {neg_cat})", color="white", fontsize=9)
+        ax.set_title(f"{pos_cat.upper()} vs {neg_cat.upper()}", color="white", fontsize=10)
+        ax.tick_params(colors="white")
+        for sp in ["top", "right"]:
+            ax.spines[sp].set_visible(False)
+        for sp in ["bottom", "left"]:
+            ax.spines[sp].set_color(SPINE_COL)
+        prev_lobe = None
+        for ri, roi in enumerate(ROIS):
+            if roi["lobe"] != prev_lobe and prev_lobe is not None:
+                ax.axvline(ri-0.5, color="#666", linewidth=1.0, linestyle=":")
+            prev_lobe = roi["lobe"]
+        plt.tight_layout()
+        safe_label = f"{pos_cat}_vs_{neg_cat}"
+        plt.savefig(ANALYSIS_DIR / f"roiE_contrast_{safe_label}.png",
+                    dpi=150, bbox_inches="tight", facecolor=DARK_BG)
+        plt.close()
+        print(f"  Saved: roiE_contrast_{safe_label}.png")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Printed mapping table
@@ -1000,38 +983,25 @@ for roi in ROIS:
           f"{best_r:>+7.4f}  {best_layer:>5d}  {best_layer/N_LAYERS:>5.2f}")
 
 print("\n" + "="*90)
-print("ABLITERATION TARGET SUMMARY")
+print("DATA-DRIVEN CATEGORY SUMMARY")
 print("="*90)
-print("""
-Goal A — Porn addiction (cortical proxies for NAcc reward circuit):
-  Primary:   OFC  (reward valuation of VSS, lateral OFC = erotic pleasure)
-             MPFC (cue reactivity, vmPFC subjective arousal)
-             ACC  (ventral ACC activated in porn CS+ conditioning)
-  Secondary: FPC  (frontopolar — hyper-connected in addicted group)
-             INS  (anterior insula — craving interoception)
-  Contrast to use: 'Porn vs Kissing' and 'Porn vs Cute'
+print("\nPer-category top ROIs (sorted by peak |r| across all layers):")
+for cat in cats_with_data:
+    # Collect (roi_label, peak_r, best_layer) and sort by strength
+    roi_scores = []
+    for roi in ROIS:
+        r = layer_roi_r[cat][roi["key"]]
+        li = int(np.argmax(np.abs(r)))
+        roi_scores.append((roi["label"], r[li], li))
+    roi_scores.sort(key=lambda x: abs(x[1]), reverse=True)
+    print(f"\n  {cat.upper()}:")
+    for label, peak_r, best_layer in roi_scores[:5]:
+        print(f"    {label:16s}  r={peak_r:+.4f}  layer={best_layer}")
 
-Goal B — Food addiction (palatability-driven overconsumption):
-  Primary:   OFC  (palatability valuation; food cue reward encoding)
-             INS  (visceral interoception; gut-to-cortex craving signal)
-             ACC  (conflict monitoring during food cue exposure)
-  Secondary: MPFC (self-relevance of food cues, cue-reactivity)
-             FPC  (top-down craving suppression / dietary control)
-  Contrast to use: 'Food vs Nature'
-  Key refs: Stoeckel et al. 2008; Jastreboff et al. 2013
-  Weight surgery should target the layer + ROI with peak Δr.
-""")
-
-print("\nREGIONS NOT MAPPABLE (outside fsaverage5 cortical surface):")
-for r in ["Nucleus accumbens  ← PRIMARY porn-reward target (subcortical)",
-          "Caudate / Putamen  ← habit-formation in addiction",
-          "Amygdala           ← emotional salience / fear conditioning",
-          "VTA / Substantia nigra  ← dopamine source",
-          "Hippocampus  (subcortical in FreeSurfer)",
-          "Thalamus & all thalamic nuclei",
-          "Hypothalamus & nuclei",
-          "Brainstem, cerebellum",
-          "All white-matter tracts & ventricular system"]:
+print("\n\nREGIONS NOT MAPPABLE (outside fsaverage5 cortical surface):")
+for r in ["Nucleus accumbens, Caudate/Putamen, Amygdala, VTA",
+          "Hippocampus, Thalamus, Hypothalamus",
+          "Brainstem, Cerebellum, White-matter tracts"]:
     print(f"  ✗  {r}")
 
 print(f"\nAll outputs → {ANALYSIS_DIR.resolve()}")

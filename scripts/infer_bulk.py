@@ -63,25 +63,22 @@ CHUNK_TIMEOUT = 120
 CHUNK = 10
 
 # ── Data layout ───────────────────────────────────────────────────────────────
-# data/baselines/  — cute, nature, food, kissing, chase, fight
-# data/targets/    — porn, gore
+# data/{category}/ — one subfolder per category, auto-discovered
 
 DATA_DIR     = Path("./data")
 ROOT_OUTPUT  = Path("./tribe_study")
 
-BASELINE_CATS = ["cute", "nature", "food", "kissing", "chase", "fight", "gore"]
-TARGET_CATS   = ["porn"]
-ALL_CATS      = BASELINE_CATS + TARGET_CATS
+def discover_categories():
+    """Auto-discover categories from subdirectory names in DATA_DIR."""
+    return sorted([d.name for d in DATA_DIR.iterdir()
+                   if d.is_dir() and any(d.glob("*.mp4"))])
 
 def discover_videos():
-    """Discover all mp4 files from baselines/ and targets/ subdirectories.
+    """Discover all mp4 files from per-category subdirectories.
     Returns list of (category, video_path) tuples."""
     videos = []
-    for cat in BASELINE_CATS:
-        for vp in sorted((DATA_DIR / "baselines").glob(f"{cat}*.mp4")):
-            videos.append((cat, vp))
-    for cat in TARGET_CATS:
-        for vp in sorted((DATA_DIR / "targets").glob(f"{cat}*.mp4")):
+    for cat in discover_categories():
+        for vp in sorted((DATA_DIR / cat).glob("*.mp4")):
             videos.append((cat, vp))
     return videos
 
@@ -214,7 +211,8 @@ def process_video(video_path: Path, out_dir: Path):
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 all_videos = discover_videos()
-print(f"Discovered {len(all_videos)} videos across {len(ALL_CATS)} categories")
+all_categories = discover_categories()
+print(f"Discovered {len(all_videos)} videos across {len(all_categories)} categories: {all_categories}")
 
 processed = skipped = 0
 current_cat = None

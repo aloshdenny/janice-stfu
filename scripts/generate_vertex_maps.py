@@ -12,65 +12,56 @@ import plotly.graph_objects as go
 from nilearn import datasets, surface
 import matplotlib.pyplot as plt
 
-# ── Load all preds ────────────────────────────────────────────────────────────
+# ── Auto-discover categories from tribe_study ─────────────────────────────────
 
 STUDY_ROOT = Path("./tribe_study")
-CATEGORIES = ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]
 MAX_TRS = 30
+
+def discover_categories():
+    """Auto-discover categories from subdirectory names with preds."""
+    cats = []
+    for d in sorted(STUDY_ROOT.iterdir()):
+        if d.is_dir() and d.name != "masks" and any(d.glob("*/preds.npy")):
+            cats.append(d.name)
+    return cats
+
+CATEGORIES = discover_categories()
+print(f"Discovered {len(CATEGORIES)} categories: {CATEGORIES}")
 
 def load_category_mean(category):
     paths = sorted((STUDY_ROOT / category).glob("*/preds.npy"))
     arrays = []
     for p in paths:
         d = np.load(p)
-        d = d[:MAX_TRS]          # truncate to 30 TRs regardless of length
+        d = d[:MAX_TRS]
         arrays.append(d.mean(axis=0))
     return np.stack(arrays).mean(axis=0)
 
 print("Loading category means...")
 means = {cat: load_category_mean(cat) for cat in CATEGORIES}
 
-# ── Contrasts ─────────────────────────────────────────────────────────────────
+# ── LOSO pairwise contrasts ───────────────────────────────────────────────────
+# No hardcoded neutral_low / neutral_high. Every category is contrasted against
+# every other in a fully data-driven design, like a radar chart.
 
-# Low-arousal neutral (valence/reward controls)
-neutral_low    = np.stack([means["cute"], means["nature"], means["food"]]).mean(axis=0)
+CONTRASTS = {}
 
-# High-arousal neutral (motion/salience/threat controls — matched to porn+gore energy)
-neutral_high   = np.stack([means["chase"], means["fight"]]).mean(axis=0)
+# 1. LOSO contrasts: each category vs the mean of ALL others
+for cat in CATEGORIES:
+    others = [c for c in CATEGORIES if c != cat]
+    others_mean = np.stack([means[c] for c in others]).mean(axis=0)
+    CONTRASTS[f"{cat} (vs rest)"] = means[cat] - others_mean
 
-porn_contrast       = means["porn"]    - neutral_low
-gore_contrast       = means["gore"]    - neutral_low
-kiss_contrast       = means["kissing"] - neutral_low
+# 2. Pairwise specificity: every ordered pair (A − B)
+for i, a in enumerate(CATEGORIES):
+    for b in CATEGORIES[i+1:]:
+        CONTRASTS[f"{a} vs {b}"] = means[a] - means[b]
+        CONTRASTS[f"{b} vs {a}"] = means[b] - means[a]
 
-# Motion-corrected: subtract high-arousal neutral to remove salience/motion confound
-porn_motion_corr    = means["porn"]    - neutral_high
-gore_motion_corr    = means["gore"]    - neutral_high
+# 3. Shared activation floor: minimum across all categories
+CONTRASTS["shared_floor"] = np.stack(list(means.values())).min(axis=0)
 
-# Specificity
-porn_specific       = porn_contrast    - gore_contrast
-gore_specific       = gore_contrast    - porn_contrast
-porn_no_romance     = porn_contrast    - kiss_contrast
-shared_arousal      = np.minimum(porn_contrast, gore_contrast)
-
-# Motion-corrected specificity (cleaner separation)
-porn_specific_mc    = porn_motion_corr - gore_motion_corr
-gore_specific_mc    = gore_motion_corr - porn_motion_corr
-
-CONTRASTS = {
-    "Porn contrast":          porn_contrast,
-    "Gore contrast":          gore_contrast,
-    "Kissing contrast":       kiss_contrast,
-    "Porn specific":          porn_specific,
-    "Gore specific":          gore_specific,
-    "Porn (no romance)":      porn_no_romance,
-    "Shared arousal":         shared_arousal,
-    "Porn (motion-corrected)": porn_motion_corr,
-    "Gore (motion-corrected)": gore_motion_corr,
-    "Porn specific (MC)":     porn_specific_mc,
-    "Gore specific (MC)":     gore_specific_mc,
-    "Neutral (low arousal)":  neutral_low,
-    "Neutral (high arousal)": neutral_high,
-}
+print(f"\n{len(CONTRASTS)} contrasts generated")
 
 # ── Save vertex masks ─────────────────────────────────────────────────────────
 
@@ -176,8 +167,13 @@ for cname, cdata in CONTRASTS.items():
 
 # ── Layout ────────────────────────────────────────────────────────────────────
 
+n_cats = len(CATEGORIES)
 fig.update_layout(
-    title=dict(text="TRIBE v2 — Contrast Maps (8 categories)", font=dict(color="white", size=16)),
+    title=dict(
+        text=f"TRIBE v2 — LOSO Contrast Maps ({n_cats} categories, "
+             f"{len(CONTRASTS)} contrasts)",
+        font=dict(color="white", size=16),
+    ),
     updatemenus=[dict(
         type="dropdown",
         buttons=dropdown_buttons,
@@ -190,11 +186,9 @@ fig.update_layout(
     )],
     annotations=[dict(
         text=(
-            "<b>MC</b> = motion-corrected (chase+fight subtracted) | "
-            "<b>Porn specific</b>: porn−gore | "
-            "<b>Gore specific</b>: gore−porn | "
-            "<b>Porn (no romance)</b>: porn−kissing | "
-            "<b>Shared arousal</b>: min(porn,gore)"
+            "<b>LOSO</b>: each category vs mean of all others | "
+            "<b>Pairwise</b>: A − B for every pair | "
+            "<b>Shared floor</b>: min across all categories"
         ),
         x=0.0, y=-0.06, xref="paper", yref="paper",
         showarrow=False, font=dict(color="#aaa", size=10), align="left",
