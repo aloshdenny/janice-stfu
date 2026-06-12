@@ -1,5 +1,6 @@
 """
-infer_bulk.py
+infer_bulk.py — Run TribeModel inference on all videos in data/{baselines,targets}.
+Skips videos that already have preds.npy in tribe_study/.
 """
 
 import os
@@ -61,20 +62,28 @@ def make_video_only_df(video_path: Path) -> pd.DataFrame:
 CHUNK_TIMEOUT = 120
 CHUNK = 10
 
-# ── Video categories ──────────────────────────────────────────────────────────
+# ── Data layout ───────────────────────────────────────────────────────────────
+# data/baselines/  — cute, nature, food, kissing, chase, fight
+# data/targets/    — porn, gore
 
-DATA_DIR = Path("./data")
+DATA_DIR     = Path("./data")
+ROOT_OUTPUT  = Path("./tribe_study")
 
-VIDEOS = {
-    "porn": "porn*.mp4",
-    "gore": "gore*.mp4",
-    "cute": "cute*.mp4",
-    "nature": "nature*.mp4",
-    "kissing": "kissing*.mp4",
-    "fight": "fight*.mp4",
-    "chase": "chase*.mp4",
-    "food": "food*.mp4",
-}
+BASELINE_CATS = ["cute", "nature", "food", "kissing", "chase", "fight", "gore"]
+TARGET_CATS   = ["porn"]
+ALL_CATS      = BASELINE_CATS + TARGET_CATS
+
+def discover_videos():
+    """Discover all mp4 files from baselines/ and targets/ subdirectories.
+    Returns list of (category, video_path) tuples."""
+    videos = []
+    for cat in BASELINE_CATS:
+        for vp in sorted((DATA_DIR / "baselines").glob(f"{cat}*.mp4")):
+            videos.append((cat, vp))
+    for cat in TARGET_CATS:
+        for vp in sorted((DATA_DIR / "targets").glob(f"{cat}*.mp4")):
+            videos.append((cat, vp))
+    return videos
 
 # ── Worker ────────────────────────────────────────────────────────────────────
 
@@ -133,8 +142,7 @@ def process_video(video_path: Path, out_dir: Path):
     final_path    = out_dir / "brain_full.png"
 
     if final_path.exists() and preds_path.exists():
-        print(f"  [SKIP] Already done: {final_path}")
-        return
+        return "skip"
 
     # Inference (skip if cached)
     if preds_path.exists() and segments_path.exists():
@@ -200,28 +208,41 @@ def process_video(video_path: Path, out_dir: Path):
     plt.savefig(final_path, dpi=150, bbox_inches="tight", pad_inches=0)
     plt.close()
     print(f"  Saved → {final_path}")
+    return "done"
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
-ROOT_OUTPUT = Path("./tribe_study")
+all_videos = discover_videos()
+print(f"Discovered {len(all_videos)} videos across {len(ALL_CATS)} categories")
 
-for category, pattern in VIDEOS.items():
-    print(f"\n{'='*50}")
-    print(f"Category: {category}")
-    print(f"{'='*50}")
+processed = skipped = 0
+current_cat = None
 
-    video_files = sorted(DATA_DIR.glob(pattern))
+for category, video_path in all_videos:
+    if category != current_cat:
+        current_cat = category
+        print(f"\n{'='*50}")
+        print(f"Category: {category}")
+        print(f"{'='*50}")
 
-    for video_path in video_files:
-        if not video_path.exists():
-            continue
+    stem    = video_path.stem
+    out_dir = ROOT_OUTPUT / category / stem
 
-        print(f"\n  Video: {video_path.name}")
-        stem = video_path.stem
-        out_dir = ROOT_OUTPUT / category / stem
+    # Skip if preds already exist
+    if (out_dir / "preds.npy").exists() and (out_dir / "brain_full.png").exists():
+        skipped += 1
+        continue
 
-        process_video(video_path.resolve(), out_dir)
+    print(f"\n  Video: {video_path.name}")
+    result = process_video(video_path.resolve(), out_dir)
+    if result == "skip":
+        skipped += 1
+    else:
+        processed += 1
 
-print("\n\nAll videos processed.")
+print(f"\n\nAll videos processed.")
+print(f"  Processed: {processed}")
+print(f"  Skipped:   {skipped}")
+print(f"  Total:     {processed + skipped}")
 print(f"Outputs in: {ROOT_OUTPUT.resolve()}")

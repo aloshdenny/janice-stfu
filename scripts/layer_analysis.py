@@ -64,6 +64,14 @@ CACHE_DIR  = Path("./cache")
 ANALYSIS_DIR    = Path("./analysis")
 ANALYSIS_DIR.mkdir(exist_ok=True)
 
+def find_videos_for_category(cat):
+    """Search both baselines/ and targets/ for videos matching this category."""
+    results = []
+    for subdir in ["baselines", "targets"]:
+        results.extend(sorted((DATA_DIR / subdir).glob(f"{cat}*.mp4")))
+    return results
+
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 CATEGORIES        = ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]
@@ -552,7 +560,7 @@ print(f"\nExtracting V-JEPA2 layer activations (batch={INFERENCE_BATCH}) …")
 cat_layer_acts = {}
 
 for cat in CATEGORIES:
-    vpaths = sorted(DATA_DIR.glob(f"{cat}*.mp4"))
+    vpaths = find_videos_for_category(cat)
     if not vpaths:
         continue
     clips = []
@@ -601,7 +609,7 @@ video_n     = {cat: {roi["key"]: 0 for roi in ROIS}
                for cat in CATEGORIES}
 
 for cat in CATEGORIES:
-    vpaths = sorted(DATA_DIR.glob(f"{cat}*.mp4"))
+    vpaths = find_videos_for_category(cat)
     for vp in vpaths:
         preds_path = STUDY_ROOT / cat / vp.stem / "preds.npy"
         if not preds_path.exists():

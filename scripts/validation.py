@@ -19,7 +19,7 @@ VAL_DIR    = Path("./val_data")
 OUT_DIR    = Path("./abliterated")
 CACHE_BASE = Path("./cache")
 STUDY_ROOT = Path("./tribe_study")
-ALPHA      = 0.1   # change freely — no re-surgery needed
+TOLERANCE  = -0.8  # tolerance scale: -1=repulsion, 0=neutral, +1=attraction
 
 def get_duration(video_path):
     r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
@@ -67,7 +67,7 @@ for d in dirs_t:
     for q in ortho: d = d - (d @ q) * q
     if d.norm() > 1e-6: ortho.append(d / d.norm())
 ortho_cpu = torch.stack(ortho)   # (n_dirs, 1408)
-print(f"\n{len(ortho)} orthogonal directions  alpha={ALPHA}")
+print(f"\n{len(ortho)} orthogonal directions  tolerance={TOLERANCE}")
 
 # ── Load model ────────────────────────────────────────────────────────────────
 
@@ -95,7 +95,7 @@ def project_cache_array(arr):
     """
     sl = torch.from_numpy(arr[CACHE_LAYER_IDX].copy()).float()  # (1408, n_clips)
     for q in ortho_cpu:
-        sl = sl - ALPHA * q.unsqueeze(1) * (q @ sl).unsqueeze(0)
+        sl = sl + TOLERANCE * q.unsqueeze(1) * (q @ sl).unsqueeze(0)
     arr[CACHE_LAYER_IDX] = sl.numpy().astype(arr.dtype)
     return arr
 

@@ -1,11 +1,22 @@
 """
 abliteration.py — Unified abliteration pipeline.
-Fully data-driven: target layers, masks, and surgery weights are all
-derived from analysis outputs. No hardcoded category assumptions.
+Includes strict mask generation (was strict_analysis.py), activation
+collection, PCA direction finding, and weight surgery.
+
+One target category is abliterated at a time against n=7 baselines.
+
+Tolerance scale (continuous, replaces alpha):
+  -1       -0.5       0       +0.5       +1
+   |--------|---------|---------|--------|
+   Repulsion Aversion  Neutral  Acceptance Attraction
+
+  tolerance < 0 → suppress / repel the concept
+  tolerance = 0 → neutral (no surgery effect)
+  tolerance > 0 → accept / tolerate the concept
 
 Usage:
-    python scripts/abliteration.py --alpha 0.2 --n_components 3
-    python scripts/abliteration.py --categories gore porn --alpha 0.15
+    python scripts/abliteration.py --target porn --tolerance -0.8
+    python scripts/abliteration.py --target porn --tolerance -1.0 --n_components 3
 """
 
 import os, gc, sys, time, json, warnings, logging, argparse
@@ -30,47 +41,256 @@ CACHE_DIR  = Path("./cache")
 DATA_DIR   = Path("./data")
 OUT_DIR    = Path("./abliterated")
 OUT_DIR.mkdir(exist_ok=True)
+MASK_DIR.mkdir(parents=True, exist_ok=True)
 
-CONFIG_PATH        = MASK_DIR / "abliteration_config.json"
 LAYER_PROFILE_PATH = MASK_DIR / "layer_profiles.npz"   # written by layer_analysis.py
+
+ALL_CATEGORIES = ["porn", "gore", "cute", "nature", "food", "kissing", "chase", "fight"]
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--alpha",        type=float, default=0.2)
+parser.add_argument("--target",       type=str,   required=True,
+                    help="Target category to abliterate (e.g. porn, gore)")
+parser.add_argument("--tolerance",    type=float, default=-0.8,
+                    help="Tolerance scale: -1=repulsion, 0=neutral, +1=attraction")
 parser.add_argument("--n_components", type=int,   default=1)
-parser.add_argument("--categories",   nargs="+",  default=None,
-                    help="Categories to abliterate. Defaults to all keys in config.")
 parser.add_argument("--layer_mode",   choices=["auto", "fixed", "dual"], default="auto",
                     help="auto=peak from profile, fixed=75pct depth, dual=two peaks")
 args = parser.parse_args()
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+if args.target not in ALL_CATEGORIES:
+    sys.exit(f"[FATAL] Unknown target '{args.target}'. Must be one of: {ALL_CATEGORIES}")
+
+TARGET_CAT     = args.target
+BASELINE_CATS  = [c for c in ALL_CATEGORIES if c != TARGET_CAT]
+DEVICE         = "cuda" if torch.cuda.is_available() else "cpu"
 
 CLIP_FRAMES   = 16
 CLIP_DURATION = 4
 IMG_SIZE      = 256
+MAX_TRS       = 30
 
-# ── Load config (written by strict_analysis.py) ───────────────────────────────
+print(f"Target:    {TARGET_CAT}")
+print(f"Baselines: {BASELINE_CATS}  (n={len(BASELINE_CATS)})")
 
-if not CONFIG_PATH.exists():
-    sys.exit(f"[FATAL] {CONFIG_PATH} not found. Run strict_analysis.py first.")
+# ── Memory helpers ────────────────────────────────────────────────────────────
 
-with open(CONFIG_PATH) as f:
-    config = json.load(f)
+def free():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
-target_categories = args.categories or list(config.keys())
-print(f"Target categories: {target_categories}")
-for cat in target_categories:
-    if cat not in config:
-        sys.exit(f"[FATAL] '{cat}' not in config. Run strict_analysis.py first.")
+def ram_available_mb():
+    try:
+        import subprocess
+        r = subprocess.run(['free', '-m'], capture_output=True, text=True)
+        for line in r.stdout.splitlines():
+            if line.startswith('Mem:'):
+                return int(line.split()[6])
+    except Exception:
+        pass
+    return 99999
 
-# ── Layer target selection ────────────────────────────────────────────────────
+def report_mem(tag=""):
+    if torch.cuda.is_available():
+        a = torch.cuda.memory_allocated() / 1024**2
+        r = torch.cuda.memory_reserved() / 1024**2
+        print(f"  [MEM{(' '+tag) if tag else ''}] alloc={a:.0f}MB reserved={r:.0f}MB")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 0: Strict mask generation  (was strict_analysis.py)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def load_category_mean(category):
+    paths = sorted((STUDY_ROOT / category).glob("*/preds.npy"))
+    if not paths:
+        sys.exit(f"[FATAL] No preds found for '{category}' in {STUDY_ROOT / category}. "
+                 f"Run infer_bulk.py first.")
+    arrays = [np.load(p)[:MAX_TRS].mean(axis=0) for p in paths]
+    return np.stack(arrays).mean(axis=0)
+
+def make_strict_mask(contrast, pct=90):
+    thresh = np.percentile(contrast, pct)
+    return (contrast > thresh) & (contrast > 0)
+
+def score_mask(target_cat, mask, means, categories):
+    """
+    Composite score:
+      1. selectivity = target_mean - mean_of_others  (higher is better)
+      2. food_penalty = max(0, food_mean - target_mean)  (zero is ideal)
+      3. n_verts >= 100 sanity gate
+    Returns None if mask fails the gate.
+    """
+    if mask.sum() < 100:
+        return None
+    target_val = float(means[target_cat][mask].mean())
+    other_cats = [c for c in categories if c != target_cat]
+    other_val  = float(np.stack([means[c][mask] for c in other_cats]).mean())
+    food_val   = float(means["food"][mask].mean())
+    selectivity  = target_val - other_val
+    food_penalty = max(0.0, food_val - target_val)
+    return selectivity - 2.0 * food_penalty
+
+def run_strict_mask_generation():
+    """Phase 0: generate contrast masks and auto-select the best one for TARGET_CAT."""
+    print(f"\n{'='*60}")
+    print(f"PHASE 0 — Strict mask generation for '{TARGET_CAT}'")
+    print(f"{'='*60}")
+
+    print("Loading category means...")
+    means = {cat: load_category_mean(cat) for cat in ALL_CATEGORIES}
+
+    # ── Build contrasts ────────────────────────────────────────────────────
+    # baseline = mean of all non-target categories
+    baseline_mean = np.stack([means[c] for c in BASELINE_CATS]).mean(axis=0)
+
+    # 1. Target vs all baselines
+    target_allneutral = means[TARGET_CAT] - baseline_mean
+
+    # 2. Target-specific: cross-subtract with each other target-like category
+    #    (if target is porn, subtract gore contrast and vice versa)
+    other_targets = [c for c in ["porn", "gore"] if c != TARGET_CAT]
+    if other_targets:
+        other_contrast = means[other_targets[0]] - baseline_mean
+        target_specific = target_allneutral - other_contrast
+    else:
+        target_specific = target_allneutral
+
+    # 3. Target vs closest confounds (high visual similarity)
+    confound_map = {
+        "porn": ["kissing", "chase"],
+        "gore": ["fight", "chase"],
+    }
+    confounds = confound_map.get(TARGET_CAT, BASELINE_CATS[:2])
+    target_tight = means[TARGET_CAT] - np.stack([means[c] for c in confounds]).mean(axis=0)
+
+    # 4. Target with explicit food exclusion
+    no_food_baselines = [c for c in BASELINE_CATS if c != "food"]
+    target_no_food = means[TARGET_CAT] - np.stack(
+        [means[c] for c in no_food_baselines]
+    ).mean(axis=0)
+
+    CONTRASTS = {
+        f"{TARGET_CAT}_allneutral": target_allneutral,
+        f"{TARGET_CAT}_specific":   target_specific,
+        f"{TARGET_CAT}_tight":      target_tight,
+        f"{TARGET_CAT}_no_food":    target_no_food,
+    }
+
+    # 5. Bicontrast: target > every other category individually (logical AND)
+    bicontrast_mask = np.ones(len(baseline_mean), dtype=bool)
+    for c in BASELINE_CATS:
+        bicontrast_mask &= (means[TARGET_CAT] - means[c] > 0)
+    # Also require > other targets
+    for c in other_targets:
+        bicontrast_mask &= (means[TARGET_CAT] - means[c] > 0)
+    CONTRASTS[f"{TARGET_CAT}_strict_bicontrast"] = None  # mask-only, no contrast array
+
+    # 6. Multivariate all: target > every single other category
+    multivariate_mask = np.ones(len(baseline_mean), dtype=bool)
+    for c in ALL_CATEGORIES:
+        if c != TARGET_CAT:
+            multivariate_mask &= (means[TARGET_CAT] - means[c] > 0)
+    CONTRASTS[f"{TARGET_CAT}_strict_multivariate_all"] = None
+
+    # ── Generate masks ─────────────────────────────────────────────────────
+    print(f"\n{'Name':35s}  {'n_verts':>8}  {'LH':>6}  {'RH':>6}  {'mean_val':>10}")
+    print("-" * 75)
+
+    new_masks = {}
+    for name, data in CONTRASTS.items():
+        if data is not None:
+            mask = make_strict_mask(data, pct=90)
+        elif "bicontrast" in name:
+            mask = bicontrast_mask
+        elif "multivariate" in name:
+            mask = multivariate_mask
+        else:
+            continue
+        new_masks[name] = mask
+        lh = mask[:10242].sum()
+        rh = mask[10242:].sum()
+        # For contrast-based masks, report mean contrast value
+        if data is not None:
+            mean_val = float(data[mask].mean()) if mask.sum() > 0 else 0
+        else:
+            mean_val = float(means[TARGET_CAT][mask].mean()) if mask.sum() > 0 else 0
+        print(f"  {name:33s}  {mask.sum():8d}  {lh:6d}  {rh:6d}  {mean_val:10.4f}")
+
+    # ── Selectivity check ──────────────────────────────────────────────────
+    print("\nSelectivity check (mean activation per category in each mask):")
+    print(f"{'Category':12s}", end="")
+    for name in new_masks:
+        short = name.replace(f"{TARGET_CAT}_", "")[:12]
+        print(f"  {short:>12}", end="")
+    print()
+    print("-" * (14 + 14 * len(new_masks)))
+
+    for cat in ALL_CATEGORIES:
+        preds_paths = sorted((STUDY_ROOT / cat).glob("*/preds.npy"))
+        if not preds_paths:
+            continue
+        cat_mean = np.stack([np.load(p)[:MAX_TRS].mean(axis=0)
+                             for p in preds_paths]).mean(axis=0)
+        print(f"  {cat:12s}", end="")
+        for mask in new_masks.values():
+            val = float(cat_mean[mask].mean()) if mask.sum() > 0 else 0
+            print(f"  {val:12.4f}", end="")
+        print()
+
+    # ── Save masks ─────────────────────────────────────────────────────────
+    for name, mask in new_masks.items():
+        np.save(MASK_DIR / f"{name}_strict.npy", mask)
+    print(f"\nMasks saved → {MASK_DIR}")
+
+    # ── Auto-select best mask ──────────────────────────────────────────────
+    candidates = list(new_masks.keys())
+    best_name, best_score = None, -np.inf
+    for name in candidates:
+        mask = new_masks[name]
+        s = score_mask(TARGET_CAT, mask, means, ALL_CATEGORIES)
+        if s is not None and s > best_score:
+            best_score, best_name = s, name
+
+    if best_name is None:
+        sys.exit(f"[FATAL] No valid mask found for '{TARGET_CAT}'")
+
+    config = {
+        TARGET_CAT: {
+            "mask_file": str(MASK_DIR / f"{best_name}_strict.npy"),
+            "mask_name": best_name,
+            "score":     round(float(best_score), 6),
+            "n_verts":   int(new_masks[best_name].sum()),
+        }
+    }
+    print(f"\nAUTO-SELECTED: {best_name}  score={best_score:.4f}  "
+          f"n={new_masks[best_name].sum()} vertices")
+
+    config_path = MASK_DIR / "abliteration_config.json"
+
+    # Merge with existing config (other targets from prior runs)
+    if config_path.exists():
+        with open(config_path) as f:
+            existing = json.load(f)
+        existing.update(config)
+        config = existing
+
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"Config written → {config_path}")
+
+    return config
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Layer target selection
+# ══════════════════════════════════════════════════════════════════════════════
 
 def pick_target_layers(cat, n_layers, mode, layer_profiles=None):
     """
     Returns a list of layer indices to run surgery on.
-    
+
     auto:  load per-category layer correlation profile from analysis output,
            find the peak layer within each of the two TRIBE-sampled windows
            (shallow: 0–19, deep: 20–39), return the one with higher peak r.
@@ -103,43 +323,15 @@ def pick_target_layers(cat, n_layers, mode, layer_profiles=None):
 
 
 def load_layer_profiles():
-    """
-    Load per-category mean |Pearson r| profiles across ROIs.
-    These are computed in layer_analysis.py and saved as a .npz.
-    Returns None if file doesn't exist (graceful fallback).
-    """
     if not LAYER_PROFILE_PATH.exists():
         print(f"  [WARN] {LAYER_PROFILE_PATH} not found — using fixed layer mode.")
         return None
     data = np.load(LAYER_PROFILE_PATH)
     return {k: data[k] for k in data.files}
 
-# ── Memory helpers ────────────────────────────────────────────────────────────
-
-def free():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
-
-def ram_available_mb():
-    try:
-        import subprocess
-        r = subprocess.run(['free', '-m'], capture_output=True, text=True)
-        for line in r.stdout.splitlines():
-            if line.startswith('Mem:'):
-                return int(line.split()[6])
-    except Exception:
-        pass
-    return 99999
-
-def report_mem(tag=""):
-    if torch.cuda.is_available():
-        a = torch.cuda.memory_allocated() / 1024**2
-        r = torch.cuda.memory_reserved() / 1024**2
-        print(f"  [MEM{(' '+tag) if tag else ''}] alloc={a:.0f}MB reserved={r:.0f}MB")
-
-# ── Video processing ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Video processing helpers
+# ══════════════════════════════════════════════════════════════════════════════
 
 normalize_fn = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                     std=[0.229, 0.224, 0.225])
@@ -182,7 +374,9 @@ def iter_clips_from_video(video_path):
     finally:
         del reader
 
-# ── Activation collection for one video ──────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 1: Activation collection for target category
+# ══════════════════════════════════════════════════════════════════════════════
 
 def collect_video_activations(video_path, mask, preds_path,
                                vjepa2_module, hook_buffer,
@@ -239,58 +433,63 @@ def collect_video_activations(video_path, mask, preds_path,
     print(f"  [WARN] {video_path.name}: no valid clips")
     return False
 
-# ── Phase 1: collect activations for all target categories ───────────────────
 
-def run_activation_collection(model, vjepa2_module, encoder_blocks, n_layers):
-    for cat in target_categories:
-        mask_path = Path(config[cat]["mask_file"])
-        mask      = np.load(mask_path)
-        acts_dir  = OUT_DIR / f"acts_{cat}"
-        acts_dir.mkdir(exist_ok=True)
+def run_activation_collection(config, vjepa2_module, encoder_blocks, n_layers):
+    print(f"\n{'='*60}")
+    print(f"PHASE 1 — Activation collection for '{TARGET_CAT}'")
+    print(f"{'='*60}")
 
-        video_files = sorted(DATA_DIR.glob(f"{cat}*.mp4"))
-        if not video_files:
-            print(f"  [WARN] No videos found for {cat}")
-            continue
+    mask_path = Path(config[TARGET_CAT]["mask_file"])
+    mask      = np.load(mask_path)
+    acts_dir  = OUT_DIR / f"acts_{TARGET_CAT}"
+    acts_dir.mkdir(exist_ok=True)
 
-        # Determine which layer to hook based on mode and profiles
-        layer_profiles = load_layer_profiles()
-        target_layers  = pick_target_layers(cat, n_layers, args.layer_mode, layer_profiles)
-        # For collection we only need one layer; use the first (primary) target
-        hook_layer = target_layers[0]
+    # Find target videos in data/targets/
+    video_files = sorted((DATA_DIR / "targets").glob(f"{TARGET_CAT}*.mp4"))
+    if not video_files:
+        sys.exit(f"[FATAL] No videos found for {TARGET_CAT} in {DATA_DIR / 'targets'}")
 
-        # Clear all existing hooks
-        for m in vjepa2_module.modules():
-            m._forward_hooks.clear()
-            m._forward_pre_hooks.clear()
+    # Determine which layer to hook
+    layer_profiles = load_layer_profiles()
+    target_layers  = pick_target_layers(TARGET_CAT, n_layers, args.layer_mode, layer_profiles)
+    hook_layer = target_layers[0]
 
-        hook_buffer = [None]
-        def hook_fn(module, input, output):
-            hidden = output[0] if isinstance(output, tuple) else output
-            hook_buffer[0] = hidden.mean(dim=1).detach().cpu().float()
+    # Clear all existing hooks
+    for m in vjepa2_module.modules():
+        m._forward_hooks.clear()
+        m._forward_pre_hooks.clear()
 
-        handle = encoder_blocks[hook_layer].register_forward_hook(hook_fn)
+    hook_buffer = [None]
+    def hook_fn(module, input, output):
+        hidden = output[0] if isinstance(output, tuple) else output
+        hook_buffer[0] = hidden.mean(dim=1).detach().cpu().float()
 
-        print(f"\n=== {cat.upper()} — {len(video_files)} videos, hook on L{hook_layer} ===")
-        report_mem("start")
+    handle = encoder_blocks[hook_layer].register_forward_hook(hook_fn)
 
-        done = failed = 0
-        for i, vp in enumerate(video_files):
-            preds_path = STUDY_ROOT / cat / vp.stem / "preds.npy"
-            ok = collect_video_activations(
-                vp, mask, preds_path,
-                vjepa2_module, hook_buffer,
-                acts_dir, cat
-            )
-            done += ok; failed += (not ok)
-            if i % 8 == 7:
-                free(); report_mem(f"after {i+1} videos")
+    print(f"\n  {len(video_files)} videos, hook on L{hook_layer}")
+    report_mem("start")
 
-        handle.remove()
-        print(f"  {cat}: {done} ok, {failed} failed")
-        free()
+    done = failed = 0
+    for i, vp in enumerate(video_files):
+        preds_path = STUDY_ROOT / TARGET_CAT / vp.stem / "preds.npy"
+        ok = collect_video_activations(
+            vp, mask, preds_path,
+            vjepa2_module, hook_buffer,
+            acts_dir, TARGET_CAT
+        )
+        done += ok; failed += (not ok)
+        if i % 8 == 7:
+            free(); report_mem(f"after {i+1} videos")
 
-# ── Direction finding (PCA on activation residuals) ───────────────────────────
+    handle.remove()
+    print(f"  {TARGET_CAT}: {done} ok, {failed} failed")
+    free()
+
+    return target_layers
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Direction finding (PCA on activation residuals)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def load_activations(cat):
     acts_dir = OUT_DIR / f"acts_{cat}"
@@ -332,7 +531,9 @@ def find_directions(X, y, n_components, label):
             print(f"  [{label}] flipped direction {i}")
     return dirs
 
-# ── Phase 2: surgery ──────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2: Surgery
+# ══════════════════════════════════════════════════════════════════════════════
 
 def apply_surgery(vjepa2_module, encoder_blocks, n_layers, all_dirs_by_layer):
     """
@@ -342,7 +543,7 @@ def apply_surgery(vjepa2_module, encoder_blocks, n_layers, all_dirs_by_layer):
     for layer_idx, dirs in all_dirs_by_layer.items():
         dirs_t = torch.tensor(dirs, dtype=torch.float32).to(DEVICE)
 
-        # Gram-Schmidt orthogonalisation across all directions for this layer
+        # Gram-Schmidt orthogonalisation
         ortho = []
         for d in dirs_t:
             for q in ortho:
@@ -356,7 +557,8 @@ def apply_surgery(vjepa2_module, encoder_blocks, n_layers, all_dirs_by_layer):
 
         ortho = torch.stack(ortho)
         block = encoder_blocks[layer_idx]
-        print(f"\n  Surgery on encoder.layer[{layer_idx}] — {len(ortho)} direction(s), alpha={args.alpha}")
+        print(f"\n  Surgery on encoder.layer[{layer_idx}] — "
+              f"{len(ortho)} direction(s), tolerance={args.tolerance}")
 
         for attr_path in ["attention.value", "attention.proj"]:
             mod = block
@@ -364,93 +566,88 @@ def apply_surgery(vjepa2_module, encoder_blocks, n_layers, all_dirs_by_layer):
                 mod = getattr(mod, part)
             W = mod.weight.data.clone()
             for q in ortho:
-                W -= args.alpha * (W @ q).unsqueeze(-1) * q
+                W += args.tolerance * (W @ q).unsqueeze(-1) * q
             mod.weight.data = W
             print(f"    {attr_path}: {tuple(W.shape)} updated")
 
-def run_surgery_pipeline(vjepa2_module, encoder_blocks, n_layers):
-    layer_profiles = load_layer_profiles()
 
-    # Accumulate directions per layer across all target categories
-    # so that if two categories share a target layer their directions
-    # are orthogonalised together rather than applied in sequence
-    dirs_by_layer = {}   # layer_idx -> list of direction arrays
+def run_surgery_pipeline(config, vjepa2_module, encoder_blocks, n_layers, target_layers):
+    print(f"\n{'='*60}")
+    print(f"PHASE 2 — Surgery for '{TARGET_CAT}'")
+    print(f"{'='*60}")
 
-    for cat in target_categories:
-        target_layers = pick_target_layers(cat, n_layers, args.layer_mode, layer_profiles)
-        X, y = load_activations(cat)
-        dirs = find_directions(X, y, args.n_components, cat)
-        del X, y; free()
+    X, y = load_activations(TARGET_CAT)
+    dirs = find_directions(X, y, args.n_components, TARGET_CAT)
+    del X, y; free()
 
-        np.save(OUT_DIR / f"{cat}_directions.npy", dirs)
-        np.save(OUT_DIR / f"{cat}_mask.npy", np.load(config[cat]["mask_file"]))
+    np.save(OUT_DIR / f"{TARGET_CAT}_directions.npy", dirs)
+    np.save(OUT_DIR / f"{TARGET_CAT}_mask.npy", np.load(config[TARGET_CAT]["mask_file"]))
 
-        # If dual mode, split directions evenly across the two target layers
-        # (first n_components//2 to shallow, rest to deep)
-        if len(target_layers) == 2:
-            mid = max(1, args.n_components // 2)
-            for tl, d in zip(target_layers, [dirs[:mid], dirs[mid:]]):
-                dirs_by_layer.setdefault(tl, [])
-                if len(d) > 0:
-                    dirs_by_layer[tl].append(d)
-        else:
-            tl = target_layers[0]
-            dirs_by_layer.setdefault(tl, [])
-            dirs_by_layer[tl].append(dirs)
-
-    # Merge per-layer and apply
-    merged = {li: np.concatenate(ds, axis=0) for li, ds in dirs_by_layer.items()}
+    # Map directions to target layers
+    dirs_by_layer = {}
+    if len(target_layers) == 2:
+        mid = max(1, args.n_components // 2)
+        for tl, d in zip(target_layers, [dirs[:mid], dirs[mid:]]):
+            if len(d) > 0:
+                dirs_by_layer[tl] = d
+    else:
+        dirs_by_layer[target_layers[0]] = dirs
 
     # Print selectivity table before surgery
-    print(f"\n{'Category':12s}", end="")
-    for cat in target_categories:
-        print(f"  {cat+'_mask':>14}", end="")
-    print()
-    print("-" * (14 + 16 * len(target_categories)))
-    all_cats = list(config.keys())
-    for eval_cat in all_cats:
-        paths = sorted((STUDY_ROOT / eval_cat).glob("*/preds.npy"))
+    mask = np.load(config[TARGET_CAT]["mask_file"])
+    print(f"\nPre-surgery selectivity ({TARGET_CAT} mask, {int(mask.sum())} verts):")
+    print(f"  {'Category':12s}  {'mean_act':>10}")
+    print(f"  {'-'*26}")
+    for cat in ALL_CATEGORIES:
+        paths = sorted((STUDY_ROOT / cat).glob("*/preds.npy"))
         if not paths:
             continue
-        cat_mean = np.stack([np.load(p)[:30].mean(axis=0) for p in paths]).mean(axis=0)
-        print(f"  {eval_cat:12s}", end="")
-        for tcat in target_categories:
-            m    = np.load(config[tcat]["mask_file"])
-            val  = float(cat_mean[m].mean()) if m.sum() > 0 else 0.0
-            print(f"  {val:14.4f}", end="")
-        print()
+        cat_mean = np.stack([np.load(p)[:MAX_TRS].mean(axis=0) for p in paths]).mean(axis=0)
+        val = float(cat_mean[mask].mean()) if mask.sum() > 0 else 0.0
+        marker = " ◄ TARGET" if cat == TARGET_CAT else ""
+        print(f"  {cat:12s}  {val:10.4f}{marker}")
         del cat_mean
 
-    apply_surgery(vjepa2_module, encoder_blocks, n_layers, merged)
+    apply_surgery(vjepa2_module, encoder_blocks, n_layers, dirs_by_layer)
 
-    # Save
-    tag      = f"a{args.alpha}_c{args.n_components}_{'_'.join(target_categories)}"
+    # Save checkpoint
+    tag      = f"t{args.tolerance}_c{args.n_components}_{TARGET_CAT}"
     out_name = f"vjepa2_abliterated_{tag}.pt"
     torch.save(vjepa2_module.state_dict(), OUT_DIR / out_name)
     canonical = OUT_DIR / "vjepa2_abliterated.pt"
     torch.save(vjepa2_module.state_dict(), canonical)
-    print(f"\n  Saved → {OUT_DIR / out_name}  ({(OUT_DIR / out_name).stat().st_size/1e6:.1f} MB)")
+    print(f"\n  Saved → {OUT_DIR / out_name}  "
+          f"({(OUT_DIR / out_name).stat().st_size/1e6:.1f} MB)")
     print(f"  Canonical → {canonical}")
 
     # Write surgery log
     surgery_log = {
-        "alpha":             args.alpha,
+        "target":            TARGET_CAT,
+        "baselines":         BASELINE_CATS,
+        "tolerance":         args.tolerance,
         "n_components":      args.n_components,
         "layer_mode":        args.layer_mode,
-        "target_categories": target_categories,
-        "layers_operated":   {str(li): int(len(ds)) for li, ds in merged.items()},
-        "masks_used":        {cat: config[cat]["mask_name"] for cat in target_categories},
+        "layers_operated":   {str(li): int(d.shape[0]) for li, d in dirs_by_layer.items()},
+        "mask_used":         config[TARGET_CAT]["mask_name"],
+        "mask_score":        config[TARGET_CAT]["score"],
     }
     with open(OUT_DIR / "surgery_log.json", "w") as f:
         json.dump(surgery_log, f, indent=2)
     print(f"  Log → {OUT_DIR / 'surgery_log.json'}")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    print(f"Alpha={args.alpha}  n_components={args.n_components}  "
-          f"layer_mode={args.layer_mode}  categories={target_categories}")
+    print(f"\nTolerance={args.tolerance}  n_components={args.n_components}  "
+          f"layer_mode={args.layer_mode}")
 
+    # Phase 0: strict mask generation
+    config = run_strict_mask_generation()
+
+    # Load model (shared across phases 1 & 2)
+    print("\nLoading TribeModel...")
     model          = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
     vjepa2_module  = model.data.video_feature.image.model.model
     encoder_blocks = vjepa2_module.encoder.layer
@@ -458,6 +655,10 @@ if __name__ == "__main__":
     vjepa2_module.eval()
     print(f"Encoder layers: {n_layers}")
 
-    run_activation_collection(model, vjepa2_module, encoder_blocks, n_layers)
-    run_surgery_pipeline(vjepa2_module, encoder_blocks, n_layers)
+    # Phase 1: activation collection
+    target_layers = run_activation_collection(config, vjepa2_module, encoder_blocks, n_layers)
+
+    # Phase 2: surgery
+    run_surgery_pipeline(config, vjepa2_module, encoder_blocks, n_layers, target_layers)
+
     print("\nDone.")
