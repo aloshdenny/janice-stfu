@@ -116,9 +116,45 @@ def render_worker(i, end, preds_chunk, segments_chunk, out_path):
 
 # ── Display ───────────────────────────────────────────────────────────────────
 
-os.environ["DISPLAY"] = ":99"
-os.system("Xvfb :99 -screen 0 1024x768x24 &> /dev/null &")
-time.sleep(1)
+def setup_xvfb(display_num=99):
+    display = f":{display_num}"
+    os.environ["DISPLAY"] = display
+    lock_file = f"/tmp/.X{display_num}-lock"
+    socket_file = f"/tmp/.X11-unix/X{display_num}"
+    
+    is_running = False
+    if os.path.exists(lock_file):
+        try:
+            with open(lock_file, "r") as f:
+                content = f.read().strip()
+                if content:
+                    pid = int(content.split()[0])
+                    try:
+                        os.kill(pid, 0)
+                        is_running = True
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+            
+    if is_running:
+        print(f"Xvfb is already running on display {display}. Using existing display server.")
+        return
+
+    # Clean up stale files
+    for path in [lock_file, socket_file]:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            print(f"Warning: Could not remove stale X11 file {path}: {e}")
+
+    # Start Xvfb
+    print(f"Starting Xvfb on display {display}...")
+    os.system(f"Xvfb {display} -screen 0 1024x768x24 > /dev/null 2>&1 &")
+    time.sleep(1)
+
+setup_xvfb(99)
 
 # ── Model (load once) ─────────────────────────────────────────────────────────
 
