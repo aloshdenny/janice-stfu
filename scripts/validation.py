@@ -1,8 +1,9 @@
 """
 validation.py — Validates abliterated model against baseline preds.
-Reads surgery_log.json to discover which layers were operated on,
-loads per-layer directions, and patches ALL operated layers in the
-cache intercept.
+
+Approach: Load the abliterated checkpoint directly into the vjepa2 encoder,
+clear all caches, and run inference. Compare against baseline preds from
+tribe_study/. No monkeypatching — works for surgery on ANY layer.
 """
 
 import os, warnings, logging
@@ -23,8 +24,6 @@ import gc, subprocess, shutil
 parser = argparse.ArgumentParser(description="Validate abliterated model.")
 parser.add_argument("--target", type=str, required=True,
                     help="Target category (e.g., 'porn')")
-parser.add_argument("--tolerance", type=float, default=None,
-                    help="Override tolerance from surgery_log (default: use log value)")
 args = parser.parse_args()
 
 VAL_DIR    = Path("./val_data")
@@ -42,12 +41,13 @@ with open(surgery_log_path) as f:
     surgery_log = json.load(f)
 
 OPERATED_LAYERS = sorted([int(k) for k in surgery_log["layers_operated"].keys()])
-TOLERANCE = args.tolerance if args.tolerance is not None else surgery_log["tolerance"]
+TOLERANCE = surgery_log["tolerance"]
 
 print(f"Target: {args.target}")
 print(f"Tolerance: {TOLERANCE}")
 print(f"Operated layers: {OPERATED_LAYERS}")
 print(f"Mask: {surgery_log['mask_used']} (score={surgery_log['mask_score']:.6f})")
+print(f"Components per layer: {surgery_log['n_components']}")
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -69,10 +69,10 @@ def make_video_only_df(video_path):
 
 target_mask_path = OUT_DIR / f"{args.target}_mask.npy"
 if not target_mask_path.exists():
-    raise FileNotFoundError(f"Mask file not found for target '{args.target}': {target_mask_path}")
+    raise FileNotFoundError(f"Mask file not found: {target_mask_path}")
 
 target_mask = np.load(target_mask_path)
-print(f"Target ({args.target}) mask: {target_mask.sum()} verts")
+print(f"\nTarget ({args.target}) mask: {target_mask.sum()} verts")
 
 val_videos = sorted(VAL_DIR.glob("*.mp4"))
 print(f"Found {len(val_videos)} validation videos")
@@ -89,132 +89,42 @@ for vp in val_videos:
     else:
         print(f"  [WARN] {vp.name}: no baseline")
 
-# ── Build per-layer ortho directions ──────────────────────────────────────────
+# ── Load model + abliterated weights ──────────────────────────────────────────
 
-def build_ortho(dirs_np):
-    """Gram-Schmidt orthogonalise a set of direction vectors."""
-    dirs_t = torch.tensor(dirs_np, dtype=torch.float32)
-    ortho = []
-    for d in dirs_t:
-        for q in ortho:
-            d = d - (d @ q) * q
-        if d.norm() > 1e-6:
-            ortho.append(d / d.norm())
-    return torch.stack(ortho) if ortho else None
+abliterated_ckpt = OUT_DIR / "vjepa2_abliterated.pt"
+if not abliterated_ckpt.exists():
+    raise FileNotFoundError(f"Abliterated checkpoint not found: {abliterated_ckpt}")
 
-# Load per-layer directions
-layer_ortho = {}  # layer_idx -> tensor of orthogonalised directions
-for li in OPERATED_LAYERS:
-    dirs_path = OUT_DIR / f"{args.target}_directions_L{li}.npy"
-    if not dirs_path.exists():
-        print(f"  [WARN] No directions file for L{li}: {dirs_path}")
-        continue
-    dirs_np = np.load(dirs_path)
-    ortho = build_ortho(dirs_np)
-    if ortho is not None:
-        layer_ortho[li] = ortho
-        print(f"  L{li}: {len(ortho)} orthogonal directions")
-    else:
-        print(f"  [WARN] L{li}: no valid directions after orthogonalisation")
-
-if not layer_ortho:
-    raise RuntimeError("No valid directions for any operated layer!")
-
-print(f"\n{len(layer_ortho)} layers with directions, tolerance={TOLERANCE}")
-
-# ── Load model ────────────────────────────────────────────────────────────────
-
-print("Loading model...")
+print(f"\nLoading model...")
 model          = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
 vjepa2_module  = model.data.video_feature.image.model.model
 encoder_blocks = vjepa2_module.encoder.layer
 N_LAYERS       = len(encoder_blocks)
 
-hf_image        = model.data.video_feature.image
-cache_n_layers  = getattr(hf_image, 'cache_n_layers', 20)
-first_cached    = N_LAYERS - cache_n_layers
+# Load the abliterated weights directly into the encoder
+print(f"Loading abliterated checkpoint: {abliterated_ckpt.name}")
+state_dict = torch.load(abliterated_ckpt, map_location="cpu")
+vjepa2_module.load_state_dict(state_dict)
+del state_dict
+vjepa2_module.eval()
+print(f"  Loaded — surgery on layers {OPERATED_LAYERS} is baked into the weights")
 
-# Map operated layer indices to cache indices
-layer_cache_map = {}  # cache_idx -> ortho_tensor
-for li, ortho in layer_ortho.items():
-    cache_idx = li - first_cached
-    if 0 <= cache_idx < cache_n_layers:
-        layer_cache_map[cache_idx] = ortho
-        print(f"  L{li} → cache_idx={cache_idx}")
-    else:
-        print(f"  [WARN] L{li} (cache_idx={cache_idx}) is outside cached range "
-              f"[{first_cached}..{first_cached + cache_n_layers - 1}], skipping")
+# ── Clear ALL caches so inference uses the modified weights ───────────────────
 
-if not layer_cache_map:
-    raise RuntimeError(
-        f"None of the operated layers {OPERATED_LAYERS} fall within the cached range "
-        f"[{first_cached}..{first_cached + cache_n_layers - 1}]. "
-        f"Cannot apply runtime patching."
-    )
+# 1. Clear in-memory cache
+cache_dict = model.data.video_feature.infra.cache_dict
+item_uid   = model.data.video_feature.infra.item_uid
+helper     = model.data.video_feature._event_types_helper
 
-print(f"Patching {len(layer_cache_map)} cache layers")
-
-# ── Projection function ───────────────────────────────────────────────────────
-
-def project_cache_array(arr):
-    """
-    arr: numpy array of shape (n_layers, 1408, n_clips)
-    Patches ALL operated layers in-place and returns arr.
-    """
-    for cache_idx, ortho in layer_cache_map.items():
-        sl = torch.from_numpy(arr[cache_idx].copy()).float()  # (1408, n_clips)
-        for q in ortho:
-            sl = sl + TOLERANCE * q.unsqueeze(1) * (q @ sl).unsqueeze(0)
-        arr[cache_idx] = sl.numpy().astype(arr.dtype)
-    return arr
-
-# ── Monkeypatch cache_dict.__getitem__ ────────────────────────────────────────
-
-cache_dict   = model.data.video_feature.infra.cache_dict
-_real_getitem = cache_dict.__class__.__getitem__
-_intercept_keys = set()
-_getitem_calls  = [0]
-_getitem_hits   = [0]
-
-def _patched_getitem(self, key):
-    val = _real_getitem(self, key)
-    _getitem_calls[0] += 1
-    if key in _intercept_keys:
-        _getitem_hits[0] += 1
-        if hasattr(val, 'data') and isinstance(val.data, np.ndarray):
-            if val.data.ndim == 3 and val.data.shape[0] == cache_n_layers \
-                    and val.data.shape[1] == 1408:
-                val.data = project_cache_array(val.data.copy())
-            else:
-                print(f"  [PATCH] unexpected cache shape {val.data.shape} for key {key!r}")
-        elif isinstance(val, np.ndarray):
-            if val.ndim == 3 and val.shape[0] == cache_n_layers and val.shape[1] == 1408:
-                val = project_cache_array(val.copy())
-            else:
-                print(f"  [PATCH] unexpected ndarray shape {val.shape}")
-        else:
-            print(f"  [PATCH] unexpected cache value type {type(val)} for key {key!r}")
-    return val
-
-cache_dict.__class__.__getitem__ = _patched_getitem
-print("cache_dict.__getitem__ monkeypatched")
-
-# ── Populate intercept keys + clear disk cache ────────────────────────────────
-
-item_uid = model.data.video_feature.infra.item_uid
-helper   = model.data.video_feature._event_types_helper
-
-print("\nRegistering intercept keys and clearing disk cache...")
+print("\nClearing caches for validation videos...")
 for vp in val_videos:
     events = helper.extract(make_video_only_df(vp))
     for ev in events:
         key = item_uid(ev)
-        _intercept_keys.add(key)
         if key in cache_dict:
             del cache_dict[key]
-    print(f"  {vp.name}: intercept key registered")
 
-# Clear disk cache
+# 2. Clear disk cache
 val_names = {vp.name for vp in val_videos}
 disk_cleared = 0
 info_files = list(CACHE_BASE.rglob("*info.jsonl"))
@@ -225,64 +135,78 @@ for info_file in info_files:
             disk_cleared += 1
     except Exception:
         pass
-print(f"Cleared {disk_cleared} disk cache dirs")
+print(f"  In-memory: cleared entries for {len(val_videos)} videos")
+print(f"  Disk: cleared {disk_cleared} cache dirs")
 
 # ── Inference loop ────────────────────────────────────────────────────────────
 
 results = []
-try:
-    for vp in val_videos:
-        stem = vp.stem
-        if stem not in baseline_preds:
-            print(f"\n[SKIP] {vp.name}")
-            continue
+for vp in val_videos:
+    stem = vp.stem
+    if stem not in baseline_preds:
+        print(f"\n[SKIP] {vp.name}")
+        continue
 
-        print(f"\n{'='*55}\nVideo: {vp.name}")
-        _getitem_calls[0] = 0
-        _getitem_hits[0]  = 0
+    print(f"\n{'='*55}\nVideo: {vp.name}")
 
-        preds_base = baseline_preds[stem]
-        df = make_video_only_df(vp)
-        preds_abl, _ = model.predict(events=df)
-        preds_abl = preds_abl[:30]
+    preds_base = baseline_preds[stem]
+    df = make_video_only_df(vp)
+    preds_abl, _ = model.predict(events=df)
+    preds_abl = preds_abl[:30]
 
-        print(f"  [DIAG] __getitem__ calls={_getitem_calls[0]}  "
-              f"intercept hits={_getitem_hits[0]}  "
-              f"layers patched={len(layer_cache_map)}")
-        if _getitem_hits[0] == 0:
-            print(f"  [DIAG] WARNING: patch never hit")
-            print(f"  [DIAG] intercept_keys: {list(_intercept_keys)[:2]}")
+    # Target mask evaluation
+    base_val = float(preds_base[:,target_mask].mean())
+    abl_val  = float(preds_abl[:,target_mask].mean())
+    diff = abl_val - base_val
+    pct  = 100*diff/(abs(base_val)+1e-9)
+    tag  = "✓ suppressed" if diff<-0.005 else \
+           ("✗ no change" if abs(diff)<0.005 else "↑ increased")
+    print(f"  {args.target + '_mask':12s}  base={base_val:.4f}  abl={abl_val:.4f}  "
+          f"Δ={diff:+.4f} ({pct:+.1f}%)  {tag}")
 
-        print()
-        # Target mask evaluation
-        base_val = float(preds_base[:,target_mask].mean())
-        abl_val  = float(preds_abl[:,target_mask].mean())
-        diff = abl_val - base_val
-        pct  = 100*diff/(abs(base_val)+1e-9)
-        tag  = "✓ suppressed" if diff<-0.005 else \
-               ("✗ no change" if abs(diff)<0.005 else "↑ increased")
-        print(f"  {args.target + '_mask':12s}  base={base_val:.4f}  abl={abl_val:.4f}  "
-              f"Δ={diff:+.4f} ({pct:+.1f}%)  {tag}")
+    # Whole brain
+    bg = float(preds_base.mean()); ag = float(preds_abl.mean())
+    print(f"  {'whole_brain':12s}  base={bg:.4f}  abl={ag:.4f}  "
+          f"Δ={ag-bg:+.4f} ({100*(ag-bg)/(abs(bg)+1e-9):+.1f}%)")
 
-        bg = float(preds_base.mean()); ag = float(preds_abl.mean())
-        print(f"  {'whole_brain':12s}  base={bg:.4f}  abl={ag:.4f}  "
-              f"Δ={ag-bg:+.4f} ({100*(ag-bg)/(abs(bg)+1e-9):+.1f}%)")
+    torch.cuda.empty_cache(); gc.collect()
+    results.append({"video":vp.name,"preds_base":preds_base,
+                     "preds_abl":preds_abl})
 
-        torch.cuda.empty_cache(); gc.collect()
-        results.append({"video":vp.name,"preds_base":preds_base,
-                         "preds_abl":preds_abl,"hits":_getitem_hits[0]})
-
-finally:
-    # Restore original __getitem__
-    cache_dict.__class__.__getitem__ = _real_getitem
-    print("\ncache_dict.__getitem__ restored.")
+# ── Summary ───────────────────────────────────────────────────────────────────
 
 print("\n"+"="*55+"\nSUMMARY")
-for r in results:
-    h = r['hits']
-    print(f"  {r['video']:20s}  {'patched '+str(h)+'x' if h>0 else 'PATCH DID NOT HIT'}  "
-          f"({len(layer_cache_map)} layers)")
+print(f"  Checkpoint: {abliterated_ckpt.name}")
+print(f"  Layers operated: {OPERATED_LAYERS}")
+print(f"  Mask: {surgery_log['mask_used']} ({int(target_mask.sum())} verts)")
+print(f"  Tolerance: {TOLERANCE}")
+print()
 
+all_diffs = []
+for r in results:
+    base_val = float(r["preds_base"][:,target_mask].mean())
+    abl_val  = float(r["preds_abl"][:,target_mask].mean())
+    diff = abl_val - base_val
+    pct = 100*diff/(abs(base_val)+1e-9)
+    tag  = "✓" if diff<-0.005 else ("✗" if abs(diff)<0.005 else "↑")
+    print(f"  {r['video']:20s}  Δ={diff:+.4f} ({pct:+.1f}%)  {tag}")
+    all_diffs.append(diff)
+
+if all_diffs:
+    mean_diff = np.mean(all_diffs)
+    print(f"\n  Mean Δ across all videos: {mean_diff:+.4f}")
+
+    # Separate by category
+    target_diffs = [d for r, d in zip(results, all_diffs)
+                    if r["video"].startswith(args.target)]
+    other_diffs  = [d for r, d in zip(results, all_diffs)
+                    if not r["video"].startswith(args.target)]
+    if target_diffs:
+        print(f"  Mean Δ on {args.target} videos: {np.mean(target_diffs):+.4f}")
+    if other_diffs:
+        print(f"  Mean Δ on other videos:  {np.mean(other_diffs):+.4f}")
+
+# Save results
 for r in results:
     s = Path(r["video"]).stem
     np.save(OUT_DIR/f"val_{s}_base.npy", r["preds_base"])
