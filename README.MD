@@ -51,3 +51,12 @@ Tolerance scale:
     python scripts/abliteration.py --target porn --tolerance -1.0
     python scripts/abliteration.py --target porn --tolerance -0.5
     python scripts/abliteration.py --target porn --tolerance  0.0
+
+
+Notes:
+
+If you run into deadlocks, run:
+
+```
+find ./cache -name "inflight.db" -delete
+```
