@@ -158,12 +158,19 @@ for vp in val_videos:
 # Clear disk cache
 val_names = {vp.name for vp in val_videos}
 disk_cleared = 0
-for info_file in CACHE_BASE.rglob("*info.jsonl"):
+
+# Convert the generator to a list first so we don't mutate the tree during traversal
+info_files = list(CACHE_BASE.rglob("*info.jsonl"))
+
+for info_file in info_files:
     try:
-        if any(n in info_file.read_text() for n in val_names):
+        # Extra safety check: verify the file wasn't already deleted 
+        # by a prior shutil.rmtree on a shared parent folder.
+        if info_file.exists() and any(n in info_file.read_text() for n in val_names):
             shutil.rmtree(info_file.parent)
             disk_cleared += 1
-    except: pass
+    except Exception: 
+        pass
 print(f"Cleared {disk_cleared} disk cache dirs")
 
 # ── Inference loop ────────────────────────────────────────────────────────────
