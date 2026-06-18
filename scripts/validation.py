@@ -1,19 +1,24 @@
 """
-validation.py
+validation.py --target
 """
-
 
 import os, warnings, logging
 warnings.filterwarnings("ignore")
 logging.disable(logging.WARNING)
 os.environ["PYTHONWARNINGS"] = "ignore"
 
+import argparse
 import numpy as np
 import torch
 import pandas as pd
 from pathlib import Path
 from tribev2.demo_utils import TribeModel
 import gc, subprocess, shutil
+
+# ── Parse Command Line Arguments ──────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="Run validation with selective target abliteration.")
+parser.add_argument("--target", type=str, required=True, help="Target category to abliterate (e.g., 'porn', 'gore')")
+args = parser.parse_args()
 
 VAL_DIR    = Path("./val_data")
 OUT_DIR    = Path("./abliterated")
@@ -35,11 +40,14 @@ def make_video_only_df(video_path):
         "filepath":str(video_path.resolve()),"frequency":60.0,"offset":0.0,
         "stop":dur,"context":float("nan")}])
 
-# ── Load masks + baseline preds ───────────────────────────────────────────────
+# ── Load Target Mask + baseline preds ─────────────────────────────────────────
 
-gore_mask = np.load(OUT_DIR / "gore_mask.npy")
-porn_mask = np.load(OUT_DIR / "porn_mask.npy")
-print(f"Gore mask: {gore_mask.sum()} verts  Porn mask: {porn_mask.sum()} verts")
+target_mask_path = OUT_DIR / f"{args.target}_mask.npy"
+if not target_mask_path.exists():
+    raise FileNotFoundError(f"Mask file not found for target '{args.target}': {target_mask_path}")
+
+target_mask = np.load(target_mask_path)
+print(f"Target ({args.target}) mask: {target_mask.sum()} verts")
 
 val_videos = sorted(VAL_DIR.glob("*.mp4"))
 print(f"Found {len(val_videos)} validation videos")
@@ -56,18 +64,20 @@ for vp in val_videos:
     else:
         print(f"  [WARN] {vp.name}: no baseline")
 
-# ── Build ortho directions ────────────────────────────────────────────────────
+# ── Build ortho directions from Target ────────────────────────────────────────
 
-gore_dirs = np.load(OUT_DIR / "gore_directions.npy")
-porn_dirs = np.load(OUT_DIR / "porn_directions.npy")
-all_dirs  = np.concatenate([gore_dirs, porn_dirs], axis=0)
-dirs_t    = torch.tensor(all_dirs, dtype=torch.float32)
+target_dirs_path = OUT_DIR / f"{args.target}_directions.npy"
+if not target_dirs_path.exists():
+    raise FileNotFoundError(f"Directions file not found for target '{args.target}': {target_dirs_path}")
+
+target_dirs = np.load(target_dirs_path)
+dirs_t      = torch.tensor(target_dirs, dtype=torch.float32)
 ortho = []
 for d in dirs_t:
     for q in ortho: d = d - (d @ q) * q
     if d.norm() > 1e-6: ortho.append(d / d.norm())
 ortho_cpu = torch.stack(ortho)   # (n_dirs, 1408)
-print(f"\n{len(ortho)} orthogonal directions  tolerance={TOLERANCE}")
+print(f"\n{len(ortho)} orthogonal directions for target '{args.target}' | tolerance={TOLERANCE}")
 
 # ── Load model ────────────────────────────────────────────────────────────────
 
@@ -100,10 +110,6 @@ def project_cache_array(arr):
     return arr
 
 # ── Monkeypatch cache_dict.__getitem__ ────────────────────────────────────────
-# exca reads cached values via cache_dict[key]. We intercept that read,
-# project the abliteration direction out of the returned array, and return
-# the modified value. This fires regardless of whether the hook return
-# value is used by the caller.
 
 cache_dict   = model.data.video_feature.infra.cache_dict
 _real_getitem = cache_dict.__class__.__getitem__
@@ -116,7 +122,6 @@ def _patched_getitem(self, key):
     _getitem_calls[0] += 1
     if key in _intercept_keys:
         _getitem_hits[0] += 1
-        # val is a TimedArray — modify its .data numpy array
         if hasattr(val, 'data') and isinstance(val.data, np.ndarray):
             if val.data.ndim == 3 and val.data.shape[0] == cache_n_layers \
                     and val.data.shape[1] == 1408:
@@ -146,14 +151,11 @@ for vp in val_videos:
     for ev in events:
         key = item_uid(ev)
         _intercept_keys.add(key)
-        # Also remove from in-memory cache to force re-read from disk
-        # (so we know the hook path is cache-read → __getitem__ → our patch)
         if key in cache_dict:
             del cache_dict[key]
     print(f"  {vp.name}: intercept key registered")
 
-# Clear disk cache so exca re-runs _HuggingFace.forward, writes to cache,
-# then reads back via our patched __getitem__
+# Clear disk cache
 val_names = {vp.name for vp in val_videos}
 disk_cleared = 0
 for info_file in CACHE_BASE.rglob("*info.jsonl"):
@@ -186,20 +188,19 @@ try:
         print(f"  [DIAG] __getitem__ calls={_getitem_calls[0]}  "
               f"intercept hits={_getitem_hits[0]}")
         if _getitem_hits[0] == 0:
-            print(f"  [DIAG] WARNING: patch never hit — "
-                  f"exca may not read via __getitem__, or key mismatch")
+            print(f"  [DIAG] WARNING: patch never hit")
             print(f"  [DIAG] intercept_keys: {list(_intercept_keys)[:2]}")
 
         print()
-        for mask, mname in [(gore_mask,"gore_mask"),(porn_mask,"porn_mask")]:
-            base_val = float(preds_base[:,mask].mean())
-            abl_val  = float(preds_abl[:,mask].mean())
-            diff = abl_val - base_val
-            pct  = 100*diff/(abs(base_val)+1e-9)
-            tag  = "✓ suppressed" if diff<-0.005 else \
-                   ("✗ no change" if abs(diff)<0.005 else "↑ increased")
-            print(f"  {mname:12s}  base={base_val:.4f}  abl={abl_val:.4f}  "
-                  f"Δ={diff:+.4f} ({pct:+.1f}%)  {tag}")
+        # Evaluates the single targeted category passed dynamically via arguments
+        base_val = float(preds_base[:,target_mask].mean())
+        abl_val  = float(preds_abl[:,target_mask].mean())
+        diff = abl_val - base_val
+        pct  = 100*diff/(abs(base_val)+1e-9)
+        tag  = "✓ suppressed" if diff<-0.005 else \
+               ("✗ no change" if abs(diff)<0.005 else "↑ increased")
+        print(f"  {args.target + '_mask':12s}  base={base_val:.4f}  abl={abl_val:.4f}  "
+              f"Δ={diff:+.4f} ({pct:+.1f}%)  {tag}")
 
         bg = float(preds_base.mean()); ag = float(preds_abl.mean())
         print(f"  {'whole_brain':12s}  base={bg:.4f}  abl={ag:.4f}  "
