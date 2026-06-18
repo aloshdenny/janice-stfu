@@ -1,11 +1,11 @@
 """
 abliteration.py — Unified abliteration pipeline.
-Includes strict mask generation (was strict_analysis.py), activation
-collection, PCA direction finding, and weight surgery.
+Includes strict mask generation, per-layer activation collection,
+PCA direction finding, and multi-layer weight surgery.
 
-One target category is abliterated at a time against n=7 baselines.
+One target category is abliterated at a time; all others are baselines.
 
-Tolerance scale (continuous, replaces alpha):
+Tolerance scale (continuous):
   -1       -0.5       0       +0.5       +1
    |--------|---------|---------|--------|
    Repulsion Aversion  Neutral  Acceptance Attraction
@@ -15,8 +15,7 @@ Tolerance scale (continuous, replaces alpha):
   tolerance > 0 → accept / tolerate the concept
 
 Usage:
-    python scripts/abliteration.py --target porn --tolerance -0.8
-    python scripts/abliteration.py --target porn --tolerance -1.0 --n_components 3
+    python scripts/abliteration.py --target porn --tolerance -1.0 --n_components 3 --n_layers 5
 """
 
 import os, gc, sys, time, json, warnings, logging, argparse
@@ -59,9 +58,10 @@ parser.add_argument("--target",       type=str,   required=True,
                     help="Target category to abliterate (e.g. porn)")
 parser.add_argument("--tolerance",    type=float, default=-0.8,
                     help="Tolerance scale: -1=repulsion, 0=neutral, +1=attraction")
-parser.add_argument("--n_components", type=int,   default=1)
-parser.add_argument("--layer_mode",   choices=["auto", "fixed", "dual"], default="auto",
-                    help="auto=peak from profile, fixed=75pct depth, dual=two peaks")
+parser.add_argument("--n_components", type=int,   default=3,
+                    help="Number of PCA directions per layer")
+parser.add_argument("--n_layers",     type=int,   default=5,
+                    help="Number of top layers (by |r|) to operate on")
 args = parser.parse_args()
 
 if args.target not in ALL_CATEGORIES:
@@ -107,7 +107,7 @@ def report_mem(tag=""):
         print(f"  [MEM{(' '+tag) if tag else ''}] alloc={a:.0f}MB reserved={r:.0f}MB")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 0: Strict mask generation  (was strict_analysis.py)
+# PHASE 0: Strict mask generation
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_category_mean(category):
@@ -124,22 +124,28 @@ def make_strict_mask(contrast, pct=90):
 
 def score_mask(target_cat, mask, means, categories):
     """
-    Composite score — fully data-driven, no hardcoded category assumptions.
-      1. selectivity = target_mean - mean_of_others  (higher is better)
-      2. max_leak = max activation of any non-target category in this mask
-      3. leak_penalty = max(0, max_leak - target_mean)  (zero is ideal)
-      4. n_verts >= 100 sanity gate
-    Returns None if mask fails the gate.
+    Margin-based scoring — rewards masks where the target genuinely stands apart.
+
+      min_margin  = target_val - max_leak   (must be positive for a good mask)
+      selectivity = target_val - mean(others)
+      score       = min_margin * selectivity
+
+    A mask where porn=0.32 and food=0.31 (margin=0.01) scores poorly.
+    A mask where porn=0.20 and butcher=0.16 (margin=0.04) scores well.
+
+    Returns None if mask has < 100 vertices.
     """
     if mask.sum() < 100:
         return None
-    target_val = float(means[target_cat][mask].mean())
-    other_cats = [c for c in categories if c != target_cat]
-    other_val  = float(np.stack([means[c][mask] for c in other_cats]).mean())
-    max_leak   = float(max(means[c][mask].mean() for c in other_cats))
-    selectivity  = target_val - other_val
-    leak_penalty = max(0.0, max_leak - target_val)
-    return selectivity - 2.0 * leak_penalty
+    target_val  = float(means[target_cat][mask].mean())
+    other_cats  = [c for c in categories if c != target_cat]
+    max_leak    = float(max(means[c][mask].mean() for c in other_cats))
+    mean_others = float(np.stack([means[c][mask] for c in other_cats]).mean())
+    min_margin  = target_val - max_leak      # negative = target isn't even highest
+    selectivity = target_val - mean_others
+    if min_margin <= 0:
+        return min_margin   # always loses to any positive-margin mask
+    return min_margin * selectivity
 
 def run_strict_mask_generation():
     """Phase 0: generate contrast masks and auto-select the best one for TARGET_CAT."""
@@ -227,14 +233,17 @@ def run_strict_mask_generation():
         np.save(MASK_DIR / f"{name}_strict.npy", mask)
     print(f"\nMasks saved → {MASK_DIR}")
 
-    # ── Auto-select best mask ──────────────────────────────────────────────
+    # ── Auto-select best mask (margin-based) ──────────────────────────────
+    print(f"\nMask scores (margin × selectivity):")
     candidates = list(new_masks.keys())
     best_name, best_score = None, -np.inf
     for name in candidates:
         mask = new_masks[name]
         s = score_mask(TARGET_CAT, mask, means, ALL_CATEGORIES)
-        if s is not None and s > best_score:
-            best_score, best_name = s, name
+        if s is not None:
+            print(f"  {name:35s}  score={s:+.6f}  n={int(mask.sum())}")
+            if s > best_score:
+                best_score, best_name = s, name
 
     if best_name is None:
         sys.exit(f"[FATAL] No valid mask found for '{TARGET_CAT}'")
@@ -247,7 +256,7 @@ def run_strict_mask_generation():
             "n_verts":   int(new_masks[best_name].sum()),
         }
     }
-    print(f"\nAUTO-SELECTED: {best_name}  score={best_score:.4f}  "
+    print(f"\nAUTO-SELECTED: {best_name}  score={best_score:.6f}  "
           f"n={new_masks[best_name].sum()} vertices")
 
     config_path = MASK_DIR / "abliteration_config.json"
@@ -266,42 +275,38 @@ def run_strict_mask_generation():
     return config
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Layer target selection
+# Layer target selection — top-k by |r|
 # ══════════════════════════════════════════════════════════════════════════════
 
-def pick_target_layers(cat, n_layers, mode, layer_profiles=None):
+def pick_target_layers(cat, n_layers_total, n_target_layers, layer_profiles=None):
     """
-    Returns a list of layer indices to run surgery on.
+    Returns the top-k layer indices sorted by descending |r| from the
+    per-category correlation profile.
 
-    auto:  load per-category layer correlation profile from analysis output,
-           find the peak layer within each of the two TRIBE-sampled windows
-           (shallow: 0–19, deep: 20–39), return the one with higher peak r.
-           Falls back to fixed if profiles are unavailable.
-    fixed: single layer at 75% depth (original behaviour).
-    dual:  both window peaks — runs surgery on two layers.
+    Falls back to [75% depth] if no profile is available.
     """
-    if mode == "fixed" or layer_profiles is None:
-        return [int(n_layers * 0.75)]
+    if layer_profiles is None:
+        fallback = [int(n_layers_total * 0.75)]
+        print(f"  [{cat}] No layer profiles — falling back to L{fallback[0]}")
+        return fallback
 
     if cat not in layer_profiles:
-        print(f"  [WARN] No layer profile for {cat}, falling back to fixed.")
-        return [int(n_layers * 0.75)]
+        fallback = [int(n_layers_total * 0.75)]
+        print(f"  [WARN] No layer profile for {cat}, falling back to L{fallback[0]}")
+        return fallback
 
-    profile = layer_profiles[cat]   # shape (n_layers,) — mean |r| across ROIs
+    profile = np.abs(layer_profiles[cat])   # shape (n_layers,) — mean |r| across ROIs
 
-    shallow_peak = int(np.argmax(np.abs(profile[:20])))
-    deep_peak    = int(np.argmax(np.abs(profile[20:]))) + 20
+    # Top-k layers by |r|
+    k = min(n_target_layers, len(profile))
+    top_indices = np.argsort(profile)[::-1][:k].tolist()
+    top_indices.sort()   # sort ascending for cleaner output
 
-    shallow_val  = float(np.abs(profile[shallow_peak]))
-    deep_val     = float(np.abs(profile[deep_peak]))
+    print(f"  [{cat}] Top-{k} layers by |r|:")
+    for li in top_indices:
+        print(f"    L{li:2d}  |r|={profile[li]:.4f}")
 
-    print(f"  [{cat}] shallow peak: L{shallow_peak} (|r|={shallow_val:.4f})  "
-          f"deep peak: L{deep_peak} (|r|={deep_val:.4f})")
-
-    if mode == "dual":
-        return [shallow_peak, deep_peak]
-    else:   # auto — pick the stronger window
-        return [shallow_peak if shallow_val > deep_val else deep_peak]
+    return top_indices
 
 
 def load_layer_profiles():
@@ -357,31 +362,29 @@ def iter_clips_from_video(video_path):
         del reader
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 1: Activation collection for target category
+# PHASE 1: Per-layer activation collection for target category
 # ══════════════════════════════════════════════════════════════════════════════
 
-def collect_video_activations(video_path, mask, preds_path,
-                               vjepa2_module, hook_buffer,
-                               acts_dir, cat):
+def collect_video_activations_for_layer(video_path, mask, preds_path,
+                                        vjepa2_module, hook_buffer,
+                                        layer_acts_dir, cat):
+    """Collect activations from ONE hooked layer for ONE video."""
     stem     = video_path.stem
-    act_path = acts_dir / f"{stem}_acts.npy"
-    y_path   = acts_dir / f"{stem}_y.npy"
+    act_path = layer_acts_dir / f"{stem}_acts.npy"
+    y_path   = layer_acts_dir / f"{stem}_y.npy"
 
     if act_path.exists() and y_path.exists():
         try:
             cached_y = np.load(y_path)
             if not np.isnan(cached_y).any():
-                print(f"  [CACHED] {video_path.name}")
-                return True
+                return True   # cached
         except Exception:
             pass
 
     if not preds_path.exists():
-        print(f"  [SKIP] no preds: {video_path.name}")
         return False
 
     if ram_available_mb() < 2000:
-        print("  [WAIT] low RAM, sleeping 10s...")
         time.sleep(10); free()
 
     preds = np.load(preds_path)[:30]
@@ -410,74 +413,89 @@ def collect_video_activations(video_path, mask, preds_path,
     if clip_acts:
         np.save(act_path, np.stack(clip_acts))
         np.save(y_path,   np.array(clip_ys, dtype=np.float32))
-        print(f"  {video_path.name}: {len(clip_acts)} clips")
         return True
-    print(f"  [WARN] {video_path.name}: no valid clips")
     return False
 
 
 def run_activation_collection(config, vjepa2_module, encoder_blocks, n_layers):
+    """
+    Phase 1: Collect activations at EACH target layer independently.
+    Returns target_layers list and dirs_by_layer dict.
+    """
     print(f"\n{'='*60}")
-    print(f"PHASE 1 — Activation collection for '{TARGET_CAT}'")
+    print(f"PHASE 1 — Per-layer activation collection for '{TARGET_CAT}'")
     print(f"{'='*60}")
 
     mask_path = Path(config[TARGET_CAT]["mask_file"])
     mask      = np.load(mask_path)
-    acts_dir  = OUT_DIR / f"acts_{TARGET_CAT}"
-    acts_dir.mkdir(exist_ok=True)
 
-    # Find target videos in data/{TARGET_CAT}/
+    # Find target videos
     video_files = sorted((DATA_DIR / TARGET_CAT).glob("*.mp4"))
     if not video_files:
         sys.exit(f"[FATAL] No videos found for {TARGET_CAT} in {DATA_DIR / TARGET_CAT}")
 
-    # Determine which layer to hook
+    # Determine which layers to operate on
     layer_profiles = load_layer_profiles()
-    target_layers  = pick_target_layers(TARGET_CAT, n_layers, args.layer_mode, layer_profiles)
-    hook_layer = target_layers[0]
+    target_layers  = pick_target_layers(TARGET_CAT, n_layers, args.n_layers, layer_profiles)
 
-    # Clear all existing hooks
-    for m in vjepa2_module.modules():
-        m._forward_hooks.clear()
-        m._forward_pre_hooks.clear()
-
-    hook_buffer = [None]
-    def hook_fn(module, input, output):
-        hidden = output[0] if isinstance(output, tuple) else output
-        hook_buffer[0] = hidden.mean(dim=1).detach().cpu().float()
-
-    handle = encoder_blocks[hook_layer].register_forward_hook(hook_fn)
-
-    print(f"\n  {len(video_files)} videos, hook on L{hook_layer}")
+    print(f"\n  {len(video_files)} videos, collecting activations at {len(target_layers)} layers")
     report_mem("start")
 
-    done = failed = 0
-    for i, vp in enumerate(video_files):
-        preds_path = STUDY_ROOT / TARGET_CAT / vp.stem / "preds.npy"
-        ok = collect_video_activations(
-            vp, mask, preds_path,
-            vjepa2_module, hook_buffer,
-            acts_dir, TARGET_CAT
-        )
-        done += ok; failed += (not ok)
-        if i % 8 == 7:
-            free(); report_mem(f"after {i+1} videos")
+    # Collect activations at each layer independently
+    for layer_idx in target_layers:
+        layer_acts_dir = OUT_DIR / f"acts_{TARGET_CAT}" / f"L{layer_idx}"
+        layer_acts_dir.mkdir(parents=True, exist_ok=True)
 
-    handle.remove()
-    print(f"  {TARGET_CAT}: {done} ok, {failed} failed")
-    free()
+        # Check if already fully cached
+        n_cached = sum(1 for vp in video_files
+                       if (layer_acts_dir / f"{vp.stem}_acts.npy").exists()
+                       and (layer_acts_dir / f"{vp.stem}_y.npy").exists())
+        if n_cached == len(video_files):
+            print(f"\n  L{layer_idx}: all {n_cached} videos cached, skipping collection")
+            continue
+
+        print(f"\n  L{layer_idx}: collecting ({n_cached}/{len(video_files)} cached)...")
+
+        # Clear hooks, set up new hook for this layer
+        for m in vjepa2_module.modules():
+            m._forward_hooks.clear()
+            m._forward_pre_hooks.clear()
+
+        hook_buffer = [None]
+        def hook_fn(module, input, output):
+            hidden = output[0] if isinstance(output, tuple) else output
+            hook_buffer[0] = hidden.mean(dim=1).detach().cpu().float()
+
+        handle = encoder_blocks[layer_idx].register_forward_hook(hook_fn)
+
+        done = failed = 0
+        for i, vp in enumerate(video_files):
+            preds_path = STUDY_ROOT / TARGET_CAT / vp.stem / "preds.npy"
+            ok = collect_video_activations_for_layer(
+                vp, mask, preds_path,
+                vjepa2_module, hook_buffer,
+                layer_acts_dir, TARGET_CAT
+            )
+            done += ok; failed += (not ok)
+            if i % 16 == 15:
+                free(); report_mem(f"L{layer_idx} after {i+1}")
+
+        handle.remove()
+        print(f"  L{layer_idx}: {done} ok, {failed} failed")
+        free()
 
     return target_layers
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Direction finding (PCA on activation residuals)
+# Direction finding (PCA on activation residuals) — per layer
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_activations(cat):
-    acts_dir = OUT_DIR / f"acts_{cat}"
+def load_activations_for_layer(cat, layer_idx):
+    """Load activations collected at a specific layer."""
+    layer_acts_dir = OUT_DIR / f"acts_{cat}" / f"L{layer_idx}"
     X_list, y_list, missing = [], [], []
-    for p in sorted(acts_dir.glob("*_acts.npy")):
-        y_p = acts_dir / p.name.replace("_acts", "_y")
+    for p in sorted(layer_acts_dir.glob("*_acts.npy")):
+        y_p = layer_acts_dir / p.name.replace("_acts", "_y")
         if not y_p.exists():
             missing.append(p.name); continue
         y_val = np.load(y_p)
@@ -486,12 +504,13 @@ def load_activations(cat):
         X_list.append(np.load(p))
         y_list.append(y_val)
     if missing:
-        print(f"  [{cat}] missing y files: {len(missing)}")
+        print(f"  [{cat} L{layer_idx}] missing y files: {len(missing)}")
     if not X_list:
-        raise FileNotFoundError(f"No activations for {cat}")
+        raise FileNotFoundError(f"No activations for {cat} at L{layer_idx}")
     X = np.concatenate(X_list)
     y = np.concatenate(y_list)
-    print(f"  [{cat}] {X.shape[0]} clips, dim={X.shape[1]}, y∈[{y.min():.3f},{y.max():.3f}]")
+    print(f"  [{cat} L{layer_idx}] {X.shape[0]} clips, dim={X.shape[1]}, "
+          f"y∈[{y.min():.3f},{y.max():.3f}]")
     return X, y
 
 def find_directions(X, y, n_components, label):
@@ -514,7 +533,7 @@ def find_directions(X, y, n_components, label):
     return dirs
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PHASE 2: Surgery
+# PHASE 2: Surgery — per-layer directions, per-layer weight modification
 # ══════════════════════════════════════════════════════════════════════════════
 
 def apply_surgery(vjepa2_module, encoder_blocks, n_layers, all_dirs_by_layer):
@@ -555,25 +574,23 @@ def apply_surgery(vjepa2_module, encoder_blocks, n_layers, all_dirs_by_layer):
 
 def run_surgery_pipeline(config, vjepa2_module, encoder_blocks, n_layers, target_layers):
     print(f"\n{'='*60}")
-    print(f"PHASE 2 — Surgery for '{TARGET_CAT}'")
+    print(f"PHASE 2 — Multi-layer surgery for '{TARGET_CAT}'")
     print(f"{'='*60}")
 
-    X, y = load_activations(TARGET_CAT)
-    dirs = find_directions(X, y, args.n_components, TARGET_CAT)
-    del X, y; free()
-
-    np.save(OUT_DIR / f"{TARGET_CAT}_directions.npy", dirs)
-    np.save(OUT_DIR / f"{TARGET_CAT}_mask.npy", np.load(config[TARGET_CAT]["mask_file"]))
-
-    # Map directions to target layers
+    # Find PCA directions per layer independently
     dirs_by_layer = {}
-    if len(target_layers) == 2:
-        mid = max(1, args.n_components // 2)
-        for tl, d in zip(target_layers, [dirs[:mid], dirs[mid:]]):
-            if len(d) > 0:
-                dirs_by_layer[tl] = d
-    else:
-        dirs_by_layer[target_layers[0]] = dirs
+    for layer_idx in target_layers:
+        label = f"{TARGET_CAT}/L{layer_idx}"
+        X, y = load_activations_for_layer(TARGET_CAT, layer_idx)
+        dirs = find_directions(X, y, args.n_components, label)
+        dirs_by_layer[layer_idx] = dirs
+
+        # Save per-layer direction file
+        np.save(OUT_DIR / f"{TARGET_CAT}_directions_L{layer_idx}.npy", dirs)
+        del X, y; free()
+
+    # Save mask
+    np.save(OUT_DIR / f"{TARGET_CAT}_mask.npy", np.load(config[TARGET_CAT]["mask_file"]))
 
     # Print selectivity table before surgery
     mask = np.load(config[TARGET_CAT]["mask_file"])
@@ -593,7 +610,7 @@ def run_surgery_pipeline(config, vjepa2_module, encoder_blocks, n_layers, target
     apply_surgery(vjepa2_module, encoder_blocks, n_layers, dirs_by_layer)
 
     # Save checkpoint
-    tag      = f"t{args.tolerance}_c{args.n_components}_{TARGET_CAT}"
+    tag      = f"t{args.tolerance}_c{args.n_components}_L{len(target_layers)}_{TARGET_CAT}"
     out_name = f"vjepa2_abliterated_{tag}.pt"
     torch.save(vjepa2_module.state_dict(), OUT_DIR / out_name)
     canonical = OUT_DIR / "vjepa2_abliterated.pt"
@@ -608,7 +625,7 @@ def run_surgery_pipeline(config, vjepa2_module, encoder_blocks, n_layers, target
         "baselines":         BASELINE_CATS,
         "tolerance":         args.tolerance,
         "n_components":      args.n_components,
-        "layer_mode":        args.layer_mode,
+        "n_layers":          args.n_layers,
         "layers_operated":   {str(li): int(d.shape[0]) for li, d in dirs_by_layer.items()},
         "mask_used":         config[TARGET_CAT]["mask_name"],
         "mask_score":        config[TARGET_CAT]["score"],
@@ -623,7 +640,7 @@ def run_surgery_pipeline(config, vjepa2_module, encoder_blocks, n_layers, target
 
 if __name__ == "__main__":
     print(f"\nTolerance={args.tolerance}  n_components={args.n_components}  "
-          f"layer_mode={args.layer_mode}")
+          f"n_layers={args.n_layers}")
 
     # Phase 0: strict mask generation
     config = run_strict_mask_generation()
@@ -637,10 +654,10 @@ if __name__ == "__main__":
     vjepa2_module.eval()
     print(f"Encoder layers: {n_layers}")
 
-    # Phase 1: activation collection
+    # Phase 1: per-layer activation collection
     target_layers = run_activation_collection(config, vjepa2_module, encoder_blocks, n_layers)
 
-    # Phase 2: surgery
+    # Phase 2: per-layer surgery
     run_surgery_pipeline(config, vjepa2_module, encoder_blocks, n_layers, target_layers)
 
     print("\nDone.")

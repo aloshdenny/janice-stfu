@@ -1,9 +1,0 @@
-Porn contrast — very focal, bilateral inferior temporal / fusiform sulcus hotspot with a clear white peak. Sparse and specific. This is the ventral visual stream body/face selective region, right-dominant. Clean signal.
-Gore contrast — completely different anatomy. Strong inferior occipital / lingual gyrus, extending along the ventral surface toward temporal pole. Bilateral white hotspots sitting lower and more posterior than porn. This is exactly the aversive visual processing signature — lingual gyrus + inferior occipital is well-established for threatening/disgusting imagery.
-Kissing contrast — mid-fusiform, more anterior than porn, slightly more bilateral. Social face processing territory. Distinct from both porn and gore which is exactly what you want from a control.
-Porn specific (MC) and Gore specific (MC) — these are now genuinely different from each other, which is the key improvement. Porn specific is more lateral/mid-temporal, gore specific is more inferior/medial. The motion correction worked.
-Gore motion-corrected — the cleanest map of the whole set. Tight bilateral inferior occipital hotspot, almost nothing elsewhere. This is your best abliteration target.
-Porn motion-corrected — broader than gore but still focused on ventral temporal, more distributed than before. Still usable.
-Shared arousal — tight bilateral fusiform cluster, mid-lateral. Small and focal, which means porn and gore genuinely diverged after motion correction — the shared component is just the general visual salience response.
-Porn no romance — very focused inferior temporal, sparser than porn contrast. The kissing subtraction cleaned it up considerably compared to the previous run.
-Porn specific vs Gore specific — now visually distinguishable, which they weren't before. Gore specific sits more inferior/posterior, porn specific more mid-lateral temporal.

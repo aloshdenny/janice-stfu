@@ -1,5 +1,8 @@
 """
-validation.py --target
+validation.py — Validates abliterated model against baseline preds.
+Reads surgery_log.json to discover which layers were operated on,
+loads per-layer directions, and patches ALL operated layers in the
+cache intercept.
 """
 
 import os, warnings, logging
@@ -8,6 +11,7 @@ logging.disable(logging.WARNING)
 os.environ["PYTHONWARNINGS"] = "ignore"
 
 import argparse
+import json
 import numpy as np
 import torch
 import pandas as pd
@@ -16,15 +20,36 @@ from tribev2.demo_utils import TribeModel
 import gc, subprocess, shutil
 
 # ── Parse Command Line Arguments ──────────────────────────────────────────────
-parser = argparse.ArgumentParser(description="Run validation with selective target abliteration.")
-parser.add_argument("--target", type=str, required=True, help="Target category to abliterate (e.g., 'porn', 'gore')")
+parser = argparse.ArgumentParser(description="Validate abliterated model.")
+parser.add_argument("--target", type=str, required=True,
+                    help="Target category (e.g., 'porn')")
+parser.add_argument("--tolerance", type=float, default=None,
+                    help="Override tolerance from surgery_log (default: use log value)")
 args = parser.parse_args()
 
 VAL_DIR    = Path("./val_data")
 OUT_DIR    = Path("./abliterated")
 CACHE_BASE = Path("./cache")
 STUDY_ROOT = Path("./tribe_study")
-TOLERANCE  = -0.8  # tolerance scale: -1=repulsion, 0=neutral, +1=attraction
+
+# ── Load surgery log ──────────────────────────────────────────────────────────
+
+surgery_log_path = OUT_DIR / "surgery_log.json"
+if not surgery_log_path.exists():
+    raise FileNotFoundError(f"surgery_log.json not found in {OUT_DIR}. Run abliteration.py first.")
+
+with open(surgery_log_path) as f:
+    surgery_log = json.load(f)
+
+OPERATED_LAYERS = sorted([int(k) for k in surgery_log["layers_operated"].keys()])
+TOLERANCE = args.tolerance if args.tolerance is not None else surgery_log["tolerance"]
+
+print(f"Target: {args.target}")
+print(f"Tolerance: {TOLERANCE}")
+print(f"Operated layers: {OPERATED_LAYERS}")
+print(f"Mask: {surgery_log['mask_used']} (score={surgery_log['mask_score']:.6f})")
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_duration(video_path):
     r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
@@ -64,20 +89,38 @@ for vp in val_videos:
     else:
         print(f"  [WARN] {vp.name}: no baseline")
 
-# ── Build ortho directions from Target ────────────────────────────────────────
+# ── Build per-layer ortho directions ──────────────────────────────────────────
 
-target_dirs_path = OUT_DIR / f"{args.target}_directions.npy"
-if not target_dirs_path.exists():
-    raise FileNotFoundError(f"Directions file not found for target '{args.target}': {target_dirs_path}")
+def build_ortho(dirs_np):
+    """Gram-Schmidt orthogonalise a set of direction vectors."""
+    dirs_t = torch.tensor(dirs_np, dtype=torch.float32)
+    ortho = []
+    for d in dirs_t:
+        for q in ortho:
+            d = d - (d @ q) * q
+        if d.norm() > 1e-6:
+            ortho.append(d / d.norm())
+    return torch.stack(ortho) if ortho else None
 
-target_dirs = np.load(target_dirs_path)
-dirs_t      = torch.tensor(target_dirs, dtype=torch.float32)
-ortho = []
-for d in dirs_t:
-    for q in ortho: d = d - (d @ q) * q
-    if d.norm() > 1e-6: ortho.append(d / d.norm())
-ortho_cpu = torch.stack(ortho)   # (n_dirs, 1408)
-print(f"\n{len(ortho)} orthogonal directions for target '{args.target}' | tolerance={TOLERANCE}")
+# Load per-layer directions
+layer_ortho = {}  # layer_idx -> tensor of orthogonalised directions
+for li in OPERATED_LAYERS:
+    dirs_path = OUT_DIR / f"{args.target}_directions_L{li}.npy"
+    if not dirs_path.exists():
+        print(f"  [WARN] No directions file for L{li}: {dirs_path}")
+        continue
+    dirs_np = np.load(dirs_path)
+    ortho = build_ortho(dirs_np)
+    if ortho is not None:
+        layer_ortho[li] = ortho
+        print(f"  L{li}: {len(ortho)} orthogonal directions")
+    else:
+        print(f"  [WARN] L{li}: no valid directions after orthogonalisation")
+
+if not layer_ortho:
+    raise RuntimeError("No valid directions for any operated layer!")
+
+print(f"\n{len(layer_ortho)} layers with directions, tolerance={TOLERANCE}")
 
 # ── Load model ────────────────────────────────────────────────────────────────
 
@@ -86,34 +129,50 @@ model          = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CAC
 vjepa2_module  = model.data.video_feature.image.model.model
 encoder_blocks = vjepa2_module.encoder.layer
 N_LAYERS       = len(encoder_blocks)
-TARGET_IDX     = int(N_LAYERS * 0.75)
 
 hf_image        = model.data.video_feature.image
 cache_n_layers  = getattr(hf_image, 'cache_n_layers', 20)
 first_cached    = N_LAYERS - cache_n_layers
-CACHE_LAYER_IDX = TARGET_IDX - first_cached
-print(f"N_LAYERS={N_LAYERS} TARGET_IDX={TARGET_IDX} "
-      f"cache_n_layers={cache_n_layers} CACHE_LAYER_IDX={CACHE_LAYER_IDX}")
-assert 0 <= CACHE_LAYER_IDX < cache_n_layers
+
+# Map operated layer indices to cache indices
+layer_cache_map = {}  # cache_idx -> ortho_tensor
+for li, ortho in layer_ortho.items():
+    cache_idx = li - first_cached
+    if 0 <= cache_idx < cache_n_layers:
+        layer_cache_map[cache_idx] = ortho
+        print(f"  L{li} → cache_idx={cache_idx}")
+    else:
+        print(f"  [WARN] L{li} (cache_idx={cache_idx}) is outside cached range "
+              f"[{first_cached}..{first_cached + cache_n_layers - 1}], skipping")
+
+if not layer_cache_map:
+    raise RuntimeError(
+        f"None of the operated layers {OPERATED_LAYERS} fall within the cached range "
+        f"[{first_cached}..{first_cached + cache_n_layers - 1}]. "
+        f"Cannot apply runtime patching."
+    )
+
+print(f"Patching {len(layer_cache_map)} cache layers")
 
 # ── Projection function ───────────────────────────────────────────────────────
 
 def project_cache_array(arr):
     """
     arr: numpy array of shape (n_layers, 1408, n_clips)
-    Modifies CACHE_LAYER_IDX slice in-place and returns arr.
+    Patches ALL operated layers in-place and returns arr.
     """
-    sl = torch.from_numpy(arr[CACHE_LAYER_IDX].copy()).float()  # (1408, n_clips)
-    for q in ortho_cpu:
-        sl = sl + TOLERANCE * q.unsqueeze(1) * (q @ sl).unsqueeze(0)
-    arr[CACHE_LAYER_IDX] = sl.numpy().astype(arr.dtype)
+    for cache_idx, ortho in layer_cache_map.items():
+        sl = torch.from_numpy(arr[cache_idx].copy()).float()  # (1408, n_clips)
+        for q in ortho:
+            sl = sl + TOLERANCE * q.unsqueeze(1) * (q @ sl).unsqueeze(0)
+        arr[cache_idx] = sl.numpy().astype(arr.dtype)
     return arr
 
 # ── Monkeypatch cache_dict.__getitem__ ────────────────────────────────────────
 
 cache_dict   = model.data.video_feature.infra.cache_dict
 _real_getitem = cache_dict.__class__.__getitem__
-_intercept_keys = set()   # populated with val video keys before each run
+_intercept_keys = set()
 _getitem_calls  = [0]
 _getitem_hits   = [0]
 
@@ -158,18 +217,13 @@ for vp in val_videos:
 # Clear disk cache
 val_names = {vp.name for vp in val_videos}
 disk_cleared = 0
-
-# Convert the generator to a list first so we don't mutate the tree during traversal
 info_files = list(CACHE_BASE.rglob("*info.jsonl"))
-
 for info_file in info_files:
     try:
-        # Extra safety check: verify the file wasn't already deleted 
-        # by a prior shutil.rmtree on a shared parent folder.
         if info_file.exists() and any(n in info_file.read_text() for n in val_names):
             shutil.rmtree(info_file.parent)
             disk_cleared += 1
-    except Exception: 
+    except Exception:
         pass
 print(f"Cleared {disk_cleared} disk cache dirs")
 
@@ -193,13 +247,14 @@ try:
         preds_abl = preds_abl[:30]
 
         print(f"  [DIAG] __getitem__ calls={_getitem_calls[0]}  "
-              f"intercept hits={_getitem_hits[0]}")
+              f"intercept hits={_getitem_hits[0]}  "
+              f"layers patched={len(layer_cache_map)}")
         if _getitem_hits[0] == 0:
             print(f"  [DIAG] WARNING: patch never hit")
             print(f"  [DIAG] intercept_keys: {list(_intercept_keys)[:2]}")
 
         print()
-        # Evaluates the single targeted category passed dynamically via arguments
+        # Target mask evaluation
         base_val = float(preds_base[:,target_mask].mean())
         abl_val  = float(preds_abl[:,target_mask].mean())
         diff = abl_val - base_val
@@ -225,7 +280,8 @@ finally:
 print("\n"+"="*55+"\nSUMMARY")
 for r in results:
     h = r['hits']
-    print(f"  {r['video']:20s}  {'patched '+str(h)+'x' if h>0 else 'PATCH DID NOT HIT'}")
+    print(f"  {r['video']:20s}  {'patched '+str(h)+'x' if h>0 else 'PATCH DID NOT HIT'}  "
+          f"({len(layer_cache_map)} layers)")
 
 for r in results:
     s = Path(r["video"]).stem
