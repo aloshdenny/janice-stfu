@@ -1,0 +1,34 @@
+{
+  "target": "porn",
+  "baselines": [
+    "argument",
+    "butcher",
+    "chase",
+    "cute",
+    "dance",
+    "fight",
+    "food",
+    "gore",
+    "kissing",
+    "nature",
+    "sports",
+    "surgery"
+  ],
+  "tolerance": -1.0,
+  "n_components": 5,
+  "n_layers": 10,
+  "layers_operated": {
+    "9": 5,
+    "10": 5,
+    "11": 5,
+    "12": 5,
+    "13": 5,
+    "14": 5,
+    "15": 5,
+    "16": 5,
+    "32": 5,
+    "39": 5
+  },
+  "mask_used": "porn_strict_multivariate",
+  "mask_score": 0.00315
+}

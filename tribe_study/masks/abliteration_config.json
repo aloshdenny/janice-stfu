@@ -1,0 +1,8 @@
+{
+  "porn": {
+    "mask_file": "tribe_study/masks/porn_strict_multivariate_strict.npy",
+    "mask_name": "porn_strict_multivariate",
+    "score": 0.00315,
+    "n_verts": 1077
+  }
+}

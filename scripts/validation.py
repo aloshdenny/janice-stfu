@@ -19,7 +19,10 @@ import json
 import numpy as np
 import torch
 import pandas as pd
+import sys
 from pathlib import Path
+sys.path.append(str(Path(__file__).parent))
+import chunk_utils
 from tribev2.demo_utils import TribeModel
 import gc, subprocess, shutil
 import matplotlib.pyplot as plt
@@ -294,17 +297,20 @@ def render_brain_comparison(stem, preds_base, preds_abl, target_mask,
 # ── Load model + abliterated weights ──────────────────────────────────────────
 
 abliterated_ckpt = OUT_DIR / "vjepa2_abliterated.pt"
-if not abliterated_ckpt.exists():
-    raise FileNotFoundError(f"Abliterated checkpoint not found: {abliterated_ckpt}")
+if not chunk_utils.check_chunked_exists(abliterated_ckpt):
+    raise FileNotFoundError(f"Abliterated chunked checkpoint not found for: {abliterated_ckpt}")
 
 print(f"\nLoading model...")
 model          = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_BASE)
+if hasattr(model.data, 'video_feature') and hasattr(model.data.video_feature, 'image'):
+    if not torch.cuda.is_available():
+        model.data.video_feature.image.device = "cpu"
 vjepa2_module  = model.data.video_feature.image.model.model
 encoder_blocks = vjepa2_module.encoder.layer
 N_LAYERS       = len(encoder_blocks)
 
 print(f"Loading abliterated checkpoint: {abliterated_ckpt.name}")
-state_dict = torch.load(abliterated_ckpt, map_location="cpu")
+state_dict = chunk_utils.load_chunked(abliterated_ckpt, map_location="cpu")
 vjepa2_module.load_state_dict(state_dict)
 del state_dict
 vjepa2_module.eval()

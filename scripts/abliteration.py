@@ -20,6 +20,8 @@ Usage:
 
 import os, gc, sys, time, json, warnings, logging, argparse
 from pathlib import Path
+sys.path.append(str(Path(__file__).parent))
+import chunk_utils
 
 warnings.filterwarnings("ignore")
 logging.disable(logging.WARNING)
@@ -612,12 +614,15 @@ def run_surgery_pipeline(config, vjepa2_module, encoder_blocks, n_layers, target
     # Save checkpoint
     tag      = f"t{args.tolerance}_c{args.n_components}_L{len(target_layers)}_{TARGET_CAT}"
     out_name = f"vjepa2_abliterated_{tag}.pt"
-    torch.save(vjepa2_module.state_dict(), OUT_DIR / out_name)
+    chunk_utils.save_chunked(vjepa2_module.state_dict(), OUT_DIR / out_name)
     canonical = OUT_DIR / "vjepa2_abliterated.pt"
-    torch.save(vjepa2_module.state_dict(), canonical)
-    print(f"\n  Saved → {OUT_DIR / out_name}  "
-          f"({(OUT_DIR / out_name).stat().st_size/1e6:.1f} MB)")
-    print(f"  Canonical → {canonical}")
+    chunk_utils.save_chunked(vjepa2_module.state_dict(), canonical)
+    
+    # Calculate total size of chunks
+    chunk_paths = chunk_utils.get_chunk_paths(OUT_DIR / out_name)
+    total_size = sum(c.stat().st_size for c in chunk_paths)
+    print(f"\n  Saved → {OUT_DIR / out_name} (in {len(chunk_paths)} chunks, {total_size/1e6:.1f} MB total)")
+    print(f"  Canonical → {canonical} (in {len(chunk_utils.get_chunk_paths(canonical))} chunks)")
 
     # Write surgery log
     surgery_log = {
@@ -648,6 +653,9 @@ if __name__ == "__main__":
     # Load model (shared across phases 1 & 2)
     print("\nLoading TribeModel...")
     model          = TribeModel.from_pretrained("facebook/tribev2", cache_folder=CACHE_DIR)
+    if hasattr(model.data, 'video_feature') and hasattr(model.data.video_feature, 'image'):
+        if not torch.cuda.is_available():
+            model.data.video_feature.image.device = "cpu"
     vjepa2_module  = model.data.video_feature.image.model.model
     encoder_blocks = vjepa2_module.encoder.layer
     n_layers       = len(encoder_blocks)
