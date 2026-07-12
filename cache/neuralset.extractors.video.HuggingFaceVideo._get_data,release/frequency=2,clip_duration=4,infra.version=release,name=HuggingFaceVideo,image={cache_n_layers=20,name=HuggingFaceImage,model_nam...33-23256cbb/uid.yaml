@@ -1,0 +1,8 @@
+clip_duration: 4.0
+frequency: 2.0
+image:
+  cache_n_layers: 20
+  model_name: facebook/vjepa2-vitg-fpc64-256
+  name: HuggingFaceImage
+infra.version: release
+name: HuggingFaceVideo

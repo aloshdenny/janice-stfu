@@ -1,0 +1,19 @@
+clip_duration: 4.0
+event_types: Video
+frequency: 2.0
+image:
+  cache_all_layers: false
+  cache_n_layers: 20
+  event_types: Image
+  imsize: null
+  infra.version: v5
+  model_name: facebook/vjepa2-vitg-fpc64-256
+  name: HuggingFaceImage
+  pretrained: true
+  token_aggregation: mean
+infra.version: release
+layer_type: ''
+max_imsize: null
+name: HuggingFaceVideo
+num_frames: null
+use_audio: true
