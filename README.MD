@@ -54,10 +54,10 @@ The dependency chain is fully linear and runs via four sequential scripts:
 
 ```mermaid
 flowchart TD
-    A["1. Bulk Inference (infer_bulk.py)"] --> B["2. Layer Analysis (layer_analysis.py)"]
-    B --> C["3. Abliteration (abliteration.py)"]
-    C --> D["4. Validation (validation.py)"]
-    D --> E["5. Generate Brain Scans (val_results/)"]
+    A["1. Bulk Inference - infer_bulk.py"] --> B["2. Layer Analysis - layer_analysis.py"]
+    B --> C["3. Abliteration - abliteration.py"]
+    C --> D["4. Validation - validation.py"]
+    D --> E["5. Generate Brain Scans - val_results"]
 ```
 
 ### 1. Bulk Inference
