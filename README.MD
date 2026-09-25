@@ -10,6 +10,10 @@ Follow these steps to set up the project locally using your existing `tribev2` C
 
 ```bash
 # 1. Clone the repository
+#    NOTE: this repo is ~10.7GB (the chunked abliterated checkpoints and the
+#    prediction set), so a full clone is slow. For code only, use:
+#      git clone --filter=blob:none https://github.com/aloshdenny/janice-stfu.git
+#    and git will fetch the large blobs lazily, only if something reads them.
 git clone https://github.com/aloshdenny/janice-stfu.git
 cd janice-stfu
 
@@ -91,8 +95,18 @@ python scripts/validation.py --target porn
 
 Because the abliterated PyTorch checkpoints (`.pt`) are extremely large (~4.14 GB each) and GitHub enforces a strict **100MB file limit** and a **2GB push size limit**:
 - **Automatic Chunking**: Checkpoints are automatically sliced into binary chunks of `<25MB` (default is `23 * 1024 * 1024` bytes / 24.12 MB) when saving in `abliteration.py`. They are saved as `vjepa2_abliterated_chunk_000.pt`, `vjepa2_abliterated_chunk_001.pt`, etc.
+- **Helpers**: use `scripts/chunk_utils.py` rather than reading these files directly --
+  `save_chunked`/`load_chunked` for `.pt` checkpoints, `save_npz`/`load_npz`/`npz_exists`
+  for arrays, `ensure_fused_zip` for image zips, and `chunk_file_if_needed` for anything
+  else. The fused file does **not** exist after a clone, only the parts do.
 - **On-Disk Re-fusing**: When loaded in `validation.py`, these chunks are merged into a temporary file on disk, read via `torch.load()`, and immediately deleted to ensure memory safety on 16GB RAM machines.
-- **Batch Pushed**: A helper utility [batch_push.py](file:///Users/aoxo/vscode/janice-stfu/scripts/batch_push.py) is used to commit and push changes to GitHub in safe `<1.2GB` batches.
+- **Pushing large histories**: GitHub also rejects a single pack much over ~2GB, so a
+  first push of this repo has to go in increments (push progressively later commits,
+  rather than the whole history at once) instead of one `git push`.
+- **Verify before pushing**: `python scripts/verify_reproducible.py` checks nothing
+  exceeds the 100MB limit, that every chunk set actually re-fuses, and that no script
+  reads a chunked artifact with a raw `torch.load`/`np.load`/`Path.exists`, which would
+  silently find nothing in a fresh clone. Exit 0 means a fresh clone will run.
 
 ---
 
