@@ -6,23 +6,41 @@ A fully data-driven pipeline for surgeon-like concept suppression or tolerance i
 
 ## 🚀 Setup & Installation
 
-Follow these steps to set up the project locally using your existing `tribev2` Conda environment:
+This repo is **~10.7GB**: the chunked abliterated checkpoints and the prediction
+set. How you clone depends on what you need.
 
+**Just the code** (measured: **5 seconds, 1.3MB on disk**):
 ```bash
-# 1. Clone the repository
-#    NOTE: this repo is ~10.7GB (the chunked abliterated checkpoints and the
-#    prediction set), so a full clone is slow. For code only, use:
-#      git clone --filter=blob:none https://github.com/aloshdenny/janice-stfu.git
-#    and git will fetch the large blobs lazily, only if something reads them.
-git clone https://github.com/aloshdenny/janice-stfu.git
+git clone --filter=blob:none --no-checkout --depth 1 https://github.com/aloshdenny/janice-stfu.git
 cd janice-stfu
-
-# 2. Activate your tribev2 conda environment
-conda activate tribev2
-
-# 3. Install required dependencies
-pip install -r requirements.txt
+git sparse-checkout set scripts README.MD requirements.txt
+git checkout main
 ```
+`--no-checkout` is the part that matters. `--filter=blob:none` alone still checks
+out every file, so git lazily fetches all the blobs anyway and you wait just as
+long. Skipping the checkout and sparse-setting first is what makes it fast.
+
+**Everything, including the checkpoints and predictions** (slow, plan for it):
+```bash
+git clone https://github.com/aloshdenny/janice-stfu.git
+```
+Or start sparse as above and pull the rest later with `git sparse-checkout disable`.
+
+**Then:**
+```bash
+conda activate tribev2          # or any Python 3.11 env
+pip install -r requirements.txt
+python scripts/verify_reproducible.py    # exit 0 = this clone will run
+```
+
+> **Chunked artifacts**: the abliterated `.pt` checkpoints are ~4.14GB each, over
+> GitHub's 100MB file limit, so they are committed as `{stem}_chunk_NNN.pt` parts
+> and the fused file **does not exist** after a clone. Always go through
+> `scripts/chunk_utils.py` -- `save_chunked`/`load_chunked` for checkpoints,
+> `save_npz`/`load_npz`/`npz_exists` for arrays, `ensure_fused_zip` for image
+> zips, `chunk_file_if_needed` for anything else -- rather than a bare
+> `torch.load` / `np.load` / `Path.exists`, which silently find nothing.
+> `verify_reproducible.py` enforces this.
 
 ---
 
